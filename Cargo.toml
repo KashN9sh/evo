@@ -1,0 +1,16 @@
+[package]
+name = "evo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.30"
+wgpu = "0.20"
+bytemuck = { version = "1.14", features = ["derive"] }
+cgmath = "0.18"
+rand = "0.8"
+pollster = "0.3"
+env_logger = "0.11"
+rayon = "1.8"
+num_cpus = "1.0"
+
