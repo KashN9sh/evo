@@ -19,7 +19,7 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
 struct ActiveSound {
-    position: cgmath::Point2<f32>,
+    position: cgmath::Point3<f32>,
     sound_type: SoundType,
     volume: f32,
     lifetime: f32,
@@ -32,7 +32,7 @@ struct SmellField {
 }
 
 struct SmellSource {
-    position: cgmath::Point2<f32>,
+    position: cgmath::Point3<f32>,
     smell_type: SmellType,
     intensity: f32,
     lifetime: f32,
@@ -129,8 +129,52 @@ impl EvolutionStats {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
-    position: [f32; 2],
+    position: [f32; 3],
     color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    view_proj: [[f32; 4]; 4],
+}
+
+struct Camera {
+    eye: cgmath::Point3<f32>,
+    target: cgmath::Point3<f32>,
+    up: cgmath::Vector3<f32>,
+    aspect: f32,
+    fovy: f32,
+    znear: f32,
+    zfar: f32,
+    // Параметры для вращения камеры
+    distance: f32, // Расстояние от цели до камеры
+    pitch: f32,    // Угол наклона (вертикальное вращение)
+    yaw: f32,      // Угол поворота (горизонтальное вращение)
+}
+
+impl Camera {
+    fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
+        // Вычисляем позицию камеры на основе расстояния и углов
+        // Используем сферические координаты:
+        // - pitch: угол от вертикали (0 = сверху, PI/2 = горизонтально, PI = снизу)
+        // - yaw: угол поворота вокруг вертикальной оси
+        let eye_x = self.target.x + self.distance * self.pitch.sin() * self.yaw.sin();
+        let eye_y = self.target.y + self.distance * self.pitch.cos(); // Вертикальная компонента
+        let eye_z = self.target.z + self.distance * self.pitch.sin() * self.yaw.cos();
+        let eye = cgmath::Point3::new(eye_x, eye_y, eye_z);
+        
+        let view = cgmath::Matrix4::look_at_rh(eye, self.target, self.up);
+        let proj = cgmath::perspective(cgmath::Deg(self.fovy), self.aspect, self.znear, self.zfar);
+        proj * view
+    }
+    
+    fn update_eye_from_angles(&mut self) {
+        // Используем ту же формулу для обновления позиции камеры
+        self.eye.x = self.target.x + self.distance * self.pitch.sin() * self.yaw.sin();
+        self.eye.y = self.target.y + self.distance * self.pitch.cos();
+        self.eye.z = self.target.z + self.distance * self.pitch.sin() * self.yaw.cos();
+    }
 }
 
 pub struct SimulationState {
@@ -140,6 +184,17 @@ pub struct SimulationState {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
+    ui_render_pipeline: wgpu::RenderPipeline,
+    depth_texture: wgpu::Texture,
+    depth_texture_view: wgpu::TextureView,
+    camera: Camera,
+    camera_uniform: Uniforms,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    camera_bind_group_layout: wgpu::BindGroupLayout,
+    ui_uniform: Uniforms,
+    ui_buffer: wgpu::Buffer,
+    ui_bind_group: wgpu::BindGroup,
     
     creatures: Vec<Creature>,
     food_system: FoodSystem,
@@ -152,6 +207,8 @@ pub struct SimulationState {
     time: f32,
     time_scale: f32,
     slider_dragging: bool,
+    camera_dragging: bool,
+    last_mouse_pos: (f32, f32),
     mouse_pos: (f32, f32),
     stats: EvolutionStats,
     active_sounds: Vec<ActiveSound>,
@@ -223,9 +280,90 @@ impl SimulationState {
 
         surface.configure(&device, &config);
 
+        // Инициализируем камеру
+        // Исходная камера была на (0, 0, 10), смотрела на (0, 0, 0)
+        // Это означает, что камера находится на оси Z, смотрит вдоль -Z
+        // В нашей системе: pitch=0 означает камеру сверху (на оси Y), но исходная была на оси Z
+        // Поэтому используем pitch=PI/2 для камеры на оси Z
+        let mut camera = Camera {
+            eye: cgmath::Point3::new(0.0, 0.0, 10.0), // Камера смотрит сверху
+            target: cgmath::Point3::new(0.0, 0.0, 0.0),
+            up: cgmath::Vector3::new(0.0, 1.0, 0.0),
+            aspect: size.width as f32 / size.height as f32,
+            fovy: 45.0,
+            znear: 0.1,
+            zfar: 100.0,
+            distance: 10.0, // Начальное расстояние
+            pitch: std::f32::consts::PI / 2.0, // Для камеры на оси Z (смотрит сверху)
+            yaw: 0.0, // Без горизонтального поворота
+        };
+        camera.update_eye_from_angles();
+        
+        let mut camera_uniform = Uniforms {
+            view_proj: camera.build_view_projection_matrix().into(),
+        };
+        
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        
+        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("camera_bind_group_layout"),
+        });
+        
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("camera_bind_group"),
+        });
+        
+        // Создаем depth texture
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            label: Some("depth_texture"),
+            view_formats: &[],
+        });
+        
+        let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        
         let shader_source = r#"
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
 struct VertexInput {
-    @location(0) position: vec2<f32>,
+    @location(0) position: vec3<f32>,
     @location(1) color: vec3<f32>,
 };
 
@@ -237,7 +375,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    output.position = vec4<f32>(input.position, 0.0, 1.0);
+    output.position = uniforms.view_proj * vec4<f32>(input.position, 1.0);
     output.color = input.color;
     return output;
 }
@@ -255,7 +393,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&camera_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -266,10 +404,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 wgpu::VertexAttribute {
                     offset: 0,
                     shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x2,
+                    format: wgpu::VertexFormat::Float32x3,
                 },
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
                 },
@@ -304,7 +442,95 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
+        // Создаем ортогональную проекцию для UI (2D overlay)
+        let ui_proj = cgmath::ortho(
+            -1.0, 1.0,  // left, right
+            -1.0, 1.0,  // bottom, top
+            -1.0, 1.0,  // near, far
+        );
+        let ui_uniform = Uniforms {
+            view_proj: ui_proj.into(),
+        };
+        
+        let ui_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("UI Buffer"),
+            contents: bytemuck::cast_slice(&[ui_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        
+        let ui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout, // Используем тот же layout
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ui_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("ui_bind_group"),
+        });
+        
+        // Создаем отдельный render pipeline для UI (без depth testing для overlay)
+        let ui_vertex_buffer_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+            ],
+        };
+        
+        let ui_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("UI Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[ui_vertex_buffer_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING), // Прозрачность для UI
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None, // UI не использует depth testing
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -320,6 +546,17 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             config,
             size,
             render_pipeline,
+            ui_render_pipeline,
+            depth_texture,
+            depth_texture_view,
+            camera,
+            camera_uniform,
+            camera_buffer,
+            camera_bind_group,
+            camera_bind_group_layout,
+            ui_uniform,
+            ui_buffer,
+            ui_bind_group,
             creatures: Vec::new(),
             food_system: FoodSystem::new(),
             physics_world: PhysicsWorld::new(size.width as f32, size.height as f32),
@@ -331,6 +568,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             time: 0.0,
             time_scale: 50.0, // Увеличиваем скорость по умолчанию в 50 раз
             slider_dragging: false,
+            camera_dragging: false,
+            last_mouse_pos: (0.0, 0.0),
             mouse_pos: (0.0, 0.0),
             stats: EvolutionStats::new(),
             active_sounds: Vec::new(),
@@ -368,7 +607,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let creature = Creature::new(
                 self.next_creature_id,
                 self.next_species_id,
-                cgmath::Point2::new(x, y),
+                cgmath::Point3::new(x, y, 0.0),
             );
             
             self.creatures.push(creature);
@@ -383,38 +622,122 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            
+            // Обновляем aspect ratio камеры
+            self.camera.aspect = new_size.width as f32 / new_size.height as f32;
+            
+            // Пересоздаем depth texture для нового размера
+            self.depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                label: Some("depth_texture"),
+                view_formats: &[],
+            });
+            self.depth_texture_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         }
     }
 
     pub fn input(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_pos = (position.x as f32, position.y as f32);
+                let new_pos = (position.x as f32, position.y as f32);
+                
+                if self.camera_dragging {
+                    // Вычисляем смещение мыши
+                    let dx = new_pos.0 - self.last_mouse_pos.0;
+                    let dy = new_pos.1 - self.last_mouse_pos.1;
+                    
+                    // Чувствительность вращения камеры
+                    let sensitivity = 0.01;
+                    
+                    // Обновляем углы камеры
+                    self.camera.yaw += dx * sensitivity;
+                    self.camera.pitch = (self.camera.pitch - dy * sensitivity)
+                        .max(0.1) // Минимум - почти сверху
+                        .min(std::f32::consts::PI - 0.1); // Максимум - почти снизу
+                    
+                    self.camera.update_eye_from_angles();
+                    
+                    // Обновляем uniform буфер камеры
+                    self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().into();
+                    self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+                }
+                
                 if self.slider_dragging {
                     self.update_slider_from_mouse();
                 }
+                
+                self.last_mouse_pos = new_pos;
+                self.mouse_pos = new_pos;
                 false
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if *button == winit::event::MouseButton::Left {
-                    match state {
-                        winit::event::ElementState::Pressed => {
-                            if self.is_mouse_on_slider() {
-                                self.slider_dragging = true;
-                                self.update_slider_from_mouse();
-                                return true;
-                            } else {
-                                // Клик по арене - спавним еду
-                                self.spawn_food_at_mouse();
-                                return true;
+                match button {
+                    winit::event::MouseButton::Left => {
+                        match state {
+                            winit::event::ElementState::Pressed => {
+                                if self.is_mouse_on_slider() {
+                                    self.slider_dragging = true;
+                                    self.update_slider_from_mouse();
+                                    return true;
+                                } else {
+                                    // Клик по арене - спавним еду
+                                    self.spawn_food_at_mouse();
+                                    return true;
+                                }
+                            }
+                            winit::event::ElementState::Released => {
+                                self.slider_dragging = false;
                             }
                         }
-                        winit::event::ElementState::Released => {
-                            self.slider_dragging = false;
+                    }
+                    winit::event::MouseButton::Right => {
+                        // Правая кнопка мыши для вращения камеры
+                        match state {
+                            winit::event::ElementState::Pressed => {
+                                self.camera_dragging = true;
+                                // Инициализируем last_mouse_pos текущей позицией мыши
+                                self.last_mouse_pos = self.mouse_pos;
+                                return true;
+                            }
+                            winit::event::ElementState::Released => {
+                                self.camera_dragging = false;
+                            }
                         }
                     }
+                    _ => {}
                 }
                 false
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Колесико мыши для приближения/отдаления
+                let zoom_speed = 1.0;
+                match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                        self.camera.distance = (self.camera.distance - y * zoom_speed)
+                            .max(2.0) // Минимальное расстояние
+                            .min(50.0); // Максимальное расстояние
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        self.camera.distance = (self.camera.distance - pos.y as f32 * 0.01)
+                            .max(2.0)
+                            .min(50.0);
+                    }
+                }
+                self.camera.update_eye_from_angles();
+                
+                // Обновляем uniform буфер камеры
+                self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().into();
+                self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+                true
             }
             _ => false,
         }
@@ -462,7 +785,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Если клик не на UI элементах, спавним еду
         if !on_slider && !on_stats {
             use crate::food::Food;
-            use cgmath::Point2;
+            use cgmath::Point3;
             use rand::Rng;
             
             let mut rng = rand::thread_rng();
@@ -475,7 +798,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let food_y = (mouse_y + offset_y).max(10.0).min(self.size.height as f32 - 10.0);
                 
                 self.food_system.foods.push(Food::new(
-                    Point2::new(food_x, food_y),
+                    Point3::new(food_x, food_y, 0.0),
                     rng.gen_range(40.0..80.0), // Немного больше энергии
                 ));
             }
@@ -663,7 +986,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 inputs.push(food_direction_y);
                 inputs.push(energy / 100.0);
                 inputs.push(age / 100.0);
-                let vel_mag = (creature_velocity.x * creature_velocity.x + creature_velocity.y * creature_velocity.y).sqrt();
+                let vel_mag = (creature_velocity.x * creature_velocity.x + creature_velocity.y * creature_velocity.y + creature_velocity.z * creature_velocity.z).sqrt();
                 inputs.push(vel_mag / 5.0);
                 
                 // Подготавливаем данные для органов чувств (только в радиусе для оптимизации)
@@ -852,9 +1175,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 // Применяем силу к скорости (F = ma, но упрощенно: F = m*v/t)
                 let mass = biomechanics_snapshot.calculate_mass(creature);
                 let acceleration = if mass > 0.0 {
-                    cgmath::Vector2::new(muscle_force.x / mass, muscle_force.y / mass)
+                    cgmath::Vector3::new(muscle_force.x / mass, muscle_force.y / mass, 0.0)
                 } else {
-                    cgmath::Vector2::new(0.0, 0.0)
+                    cgmath::Vector3::new(0.0, 0.0, 0.0)
                 };
                 
                 // Обновляем скорость ТОЛЬКО на основе активации мышц
@@ -862,21 +1185,25 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let mut new_vel = creature_velocity;
                 new_vel.x += acceleration.x * dt;
                 new_vel.y += acceleration.y * dt;
+                new_vel.z += acceleration.z * dt;
                 
                 // Применяем трение
                 let friction_coeff = biomechanics_snapshot.friction_coefficient;
-                let mag = (new_vel.x * new_vel.x + new_vel.y * new_vel.y).sqrt();
+                let mag = (new_vel.x * new_vel.x + new_vel.y * new_vel.y + new_vel.z * new_vel.z).sqrt();
                 if mag > 0.0 {
                     let friction_force = friction_coeff * mag;
                     let friction_x = (new_vel.x / mag) * friction_force;
                     let friction_y = (new_vel.y / mag) * friction_force;
+                    let friction_z = (new_vel.z / mag) * friction_force;
                     new_vel.x = new_vel.x - friction_x * dt;
                     new_vel.y = new_vel.y - friction_y * dt;
+                    new_vel.z = new_vel.z - friction_z * dt;
                     
                     // Останавливаем очень медленное движение
                     if mag < 0.01 {
                         new_vel.x = 0.0;
                         new_vel.y = 0.0;
+                        new_vel.z = 0.0;
                     }
                 }
                 
@@ -884,6 +1211,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let mut new_pos = creature_pos;
                 new_pos.x += new_vel.x * dt;
                 new_pos.y += new_vel.y * dt;
+                new_pos.z += new_vel.z * dt;
                 
                 // Проверяем границы на основе реальных размеров костей
                 // Вычисляем максимальное расстояние от центра до края костей (bounding radius)
@@ -960,7 +1288,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 }
                 
                 // Генерируем звук при движении
-                let velocity_magnitude = (new_vel.x * new_vel.x + new_vel.y * new_vel.y).sqrt();
+                let velocity_magnitude = (new_vel.x * new_vel.x + new_vel.y * new_vel.y + new_vel.z * new_vel.z).sqrt();
                 if velocity_magnitude > 0.1 {
                     self.active_sounds.push(ActiveSound {
                         position: new_pos,
@@ -1039,7 +1367,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let mut new_creature = Creature::new(
                 self.next_creature_id,
                 species_id,
-                cgmath::Point2::new(x, y),
+                cgmath::Point3::new(x, y, 0.0),
             );
             new_creature.genome = new_genome;
             new_creature.energy = 100.0;
@@ -1258,9 +1586,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     let mut child_genome = evolution_system.crossover(&parent1_genome, &parent2_genome, rng);
                     evolution_system.mutate(&mut child_genome, rng);
                     
-                    let child_position = cgmath::Point2::new(
+                    let child_position = cgmath::Point3::new(
                         (parent1_pos.x + parent2_pos.x) / 2.0 + rng.gen_range(-5.0..5.0),
                         (parent1_pos.y + parent2_pos.y) / 2.0 + rng.gen_range(-5.0..5.0),
+                        (parent1_pos.z + parent2_pos.z) / 2.0,
                     );
                     
                     // Определяем вид потомка: если родители одного вида - тот же вид,
@@ -1323,7 +1652,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             if !food.is_eaten {
                 let dx = food.position.x - creature.position.x;
                 let dy = food.position.y - creature.position.y;
-                let distance = (dx * dx + dy * dy).sqrt();
+                let dz = food.position.z - creature.position.z;
+                let distance = (dx * dx + dy * dy + dz * dz).sqrt();
                 if distance < nearest_food_distance {
                     nearest_food_distance = distance;
                     nearest_food_dx = dx;
@@ -1458,7 +1788,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         
         inputs.push(creature.energy / 100.0);
         inputs.push(creature.age / 100.0);
-        let vel_mag = (creature.velocity.x * creature.velocity.x + creature.velocity.y * creature.velocity.y).sqrt();
+        let vel_mag = (creature.velocity.x * creature.velocity.x + creature.velocity.y * creature.velocity.y + creature.velocity.z * creature.velocity.z).sqrt();
         inputs.push(vel_mag / 5.0);
         
         inputs
@@ -1561,12 +1891,24 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
 
+            // Обновляем матрицу камеры перед рендерингом
+            self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().into();
+            self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+            
             render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             
             if let Some(ref vertex_buffer) = vertex_buffer {
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
@@ -1577,22 +1919,44 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 }
             }
             
+        }
+        
+        // Отдельный render pass для UI элементов (без depth buffer)
+        {
+            let mut ui_render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("UI Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // Загружаем существующий контент
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None, // UI не использует depth buffer
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            
+            ui_render_pass.set_pipeline(&self.ui_render_pipeline);
+            ui_render_pass.set_bind_group(0, &self.ui_bind_group, &[]);
+            
             // Отрисовка статистики
             if let Some(ref stats_buffer) = stats_buffer {
-                render_pass.set_vertex_buffer(0, stats_buffer.slice(..));
-                render_pass.draw(0..stats_vertices.len() as u32, 0..1);
+                ui_render_pass.set_vertex_buffer(0, stats_buffer.slice(..));
+                ui_render_pass.draw(0..stats_vertices.len() as u32, 0..1);
             }
             
             // Отрисовка графика эволюции
             if let Some(ref graph_buffer) = graph_buffer {
-                render_pass.set_vertex_buffer(0, graph_buffer.slice(..));
-                render_pass.draw(0..graph_vertices_len as u32, 0..1);
+                ui_render_pass.set_vertex_buffer(0, graph_buffer.slice(..));
+                ui_render_pass.draw(0..graph_vertices_len as u32, 0..1);
             }
             
             // Отрисовка ползунка скорости времени
             if let Some(ref slider_buffer) = slider_buffer {
-                render_pass.set_vertex_buffer(0, slider_buffer.slice(..));
-                render_pass.draw(0..slider_vertices.len() as u32, 0..1);
+                ui_render_pass.set_vertex_buffer(0, slider_buffer.slice(..));
+                ui_render_pass.draw(0..slider_vertices.len() as u32, 0..1);
             }
         }
 
@@ -1615,9 +1979,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color[1] = color[1] * 0.4 + color[1] * energy_factor * 0.6;
         color[2] = color[2] * 0.4 + color[2] * energy_factor * 0.6;
         
-        // Нормализуем позицию в координаты экрана (-1 до 1)
-        let x = (creature.position.x / self.size.width as f32) * 2.0 - 1.0;
-        let y = 1.0 - (creature.position.y / self.size.height as f32) * 2.0;
+        // Преобразуем позицию существа в мировые 3D координаты
+        // Арена находится в плоскости XY, Z = 0
+        // Центр экрана (640, 360) соответствует (0, 0, 0) в мировых координатах
+        // Размер арены 1280x720 пикселей соответствует примерно 12.8x7.2 единиц в мире
+        let world_x = (creature.position.x - self.size.width as f32 / 2.0) / 100.0;
+        let world_y = (creature.position.y - self.size.height as f32 / 2.0) / 100.0;
+        let world_z = creature.position.z;
         
         // Масштаб для рендеринга костей (преобразуем размеры костей в нормализованные координаты)
         // Используем фиксированный масштаб для видимости
@@ -1627,50 +1995,139 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let bone_count = creature.genome.bones.len();
         if bone_count > 0 {
             for bone in &creature.genome.bones {
-                // Вычисляем позицию начала и конца кости в нормализованных координатах
-                let bone_start_x = x + bone.position.x * bone_scale;
-                let bone_start_y = y + bone.position.y * bone_scale;
-                let bone_length = bone.length * bone_scale;
+                // Вычисляем позицию начала и конца кости в мировых 3D координатах
+                // Размеры костей в пикселях, преобразуем в мировые единицы
+                let bone_start_x = world_x + bone.position.x / 100.0;
+                let bone_start_y = world_y + bone.position.y / 100.0;
+                let bone_start_z = world_z + bone.position.z / 100.0;
+                let bone_length = bone.length / 100.0;
                 let bone_end_x = bone_start_x + bone.angle.cos() * bone_length;
                 let bone_end_y = bone_start_y + bone.angle.sin() * bone_length;
+                let bone_end_z = bone_start_z;
                 
-                // Рисуем кость как линию
-                let bone_width = bone.width * bone_scale;
-                let perp_angle = bone.angle + std::f32::consts::PI / 2.0;
+                // Рисуем кость как цилиндр в 3D
+                let bone_radius = bone.width / 200.0; // Радиус цилиндра
+                let segments = 8; // Количество сегментов для цилиндра
                 
-                let p1_x = bone_start_x + perp_angle.cos() * bone_width;
-                let p1_y = bone_start_y + perp_angle.sin() * bone_width;
-                let p2_x = bone_start_x - perp_angle.cos() * bone_width;
-                let p2_y = bone_start_y - perp_angle.sin() * bone_width;
-                let p3_x = bone_end_x + perp_angle.cos() * bone_width;
-                let p3_y = bone_end_y + perp_angle.sin() * bone_width;
-                let p4_x = bone_end_x - perp_angle.cos() * bone_width;
-                let p4_y = bone_end_y - perp_angle.sin() * bone_width;
+                // Направление кости
+                let dir_x = bone_end_x - bone_start_x;
+                let dir_y = bone_end_y - bone_start_y;
+                let dir_z = bone_end_z - bone_start_z;
+                let dir_length = (dir_x * dir_x + dir_y * dir_y + dir_z * dir_z).sqrt();
                 
-                // Два треугольника для кости
-                vertices.push(Vertex { position: [p1_x, p1_y], color });
-                vertices.push(Vertex { position: [p2_x, p2_y], color });
-                vertices.push(Vertex { position: [p3_x, p3_y], color });
-                vertices.push(Vertex { position: [p2_x, p2_y], color });
-                vertices.push(Vertex { position: [p4_x, p4_y], color });
-                vertices.push(Vertex { position: [p3_x, p3_y], color });
+                if dir_length > 0.0 {
+                    // Нормализуем направление
+                    let dir_x_norm = dir_x / dir_length;
+                    let dir_y_norm = dir_y / dir_length;
+                    let dir_z_norm = dir_z / dir_length;
+                    
+                    // Вычисляем перпендикулярные векторы для создания окружности
+                    // Используем вектор, перпендикулярный направлению и оси Y
+                    let perp1 = if dir_y_norm.abs() < 0.9 {
+                        // Используем векторное произведение с (0, 1, 0)
+                        let cross_x = dir_y_norm;
+                        let cross_y = -dir_x_norm;
+                        let cross_z = 0.0;
+                        let cross_len = (cross_x * cross_x + cross_y * cross_y + cross_z * cross_z).sqrt();
+                        if cross_len > 0.0 {
+                            (cross_x / cross_len, cross_y / cross_len, cross_z / cross_len)
+                        } else {
+                            (1.0, 0.0, 0.0)
+                        }
+                    } else {
+                        (1.0, 0.0, 0.0)
+                    };
+                    
+                    // Второй перпендикулярный вектор через векторное произведение
+                    let perp2_x = dir_y_norm * perp1.2 - dir_z_norm * perp1.1;
+                    let perp2_y = dir_z_norm * perp1.0 - dir_x_norm * perp1.2;
+                    let perp2_z = dir_x_norm * perp1.1 - dir_y_norm * perp1.0;
+                    let perp2_len = (perp2_x * perp2_x + perp2_y * perp2_y + perp2_z * perp2_z).sqrt();
+                    let perp2 = if perp2_len > 0.0 {
+                        (perp2_x / perp2_len, perp2_y / perp2_len, perp2_z / perp2_len)
+                    } else {
+                        (0.0, 0.0, 1.0)
+                    };
+                    
+                    // Создаем цилиндр из сегментов
+                    for i in 0..segments {
+                        let angle1 = (i as f32 / segments as f32) * std::f32::consts::PI * 2.0;
+                        let angle2 = ((i + 1) as f32 / segments as f32) * std::f32::consts::PI * 2.0;
+                        
+                        // Точки на окружности начала кости
+                        let start_circle1_x = bone_start_x + (perp1.0 * angle1.cos() + perp2.0 * angle1.sin()) * bone_radius;
+                        let start_circle1_y = bone_start_y + (perp1.1 * angle1.cos() + perp2.1 * angle1.sin()) * bone_radius;
+                        let start_circle1_z = bone_start_z + (perp1.2 * angle1.cos() + perp2.2 * angle1.sin()) * bone_radius;
+                        
+                        let start_circle2_x = bone_start_x + (perp1.0 * angle2.cos() + perp2.0 * angle2.sin()) * bone_radius;
+                        let start_circle2_y = bone_start_y + (perp1.1 * angle2.cos() + perp2.1 * angle2.sin()) * bone_radius;
+                        let start_circle2_z = bone_start_z + (perp1.2 * angle2.cos() + perp2.2 * angle2.sin()) * bone_radius;
+                        
+                        // Точки на окружности конца кости
+                        let end_circle1_x = bone_end_x + (perp1.0 * angle1.cos() + perp2.0 * angle1.sin()) * bone_radius;
+                        let end_circle1_y = bone_end_y + (perp1.1 * angle1.cos() + perp2.1 * angle1.sin()) * bone_radius;
+                        let end_circle1_z = bone_end_z + (perp1.2 * angle1.cos() + perp2.2 * angle1.sin()) * bone_radius;
+                        
+                        let end_circle2_x = bone_end_x + (perp1.0 * angle2.cos() + perp2.0 * angle2.sin()) * bone_radius;
+                        let end_circle2_y = bone_end_y + (perp1.1 * angle2.cos() + perp2.1 * angle2.sin()) * bone_radius;
+                        let end_circle2_z = bone_end_z + (perp1.2 * angle2.cos() + perp2.2 * angle2.sin()) * bone_radius;
+                        
+                        // Два треугольника для сегмента цилиндра
+                        vertices.push(Vertex { position: [start_circle1_x, start_circle1_y, start_circle1_z], color });
+                        vertices.push(Vertex { position: [start_circle2_x, start_circle2_y, start_circle2_z], color });
+                        vertices.push(Vertex { position: [end_circle1_x, end_circle1_y, end_circle1_z], color });
+                        
+                        vertices.push(Vertex { position: [start_circle2_x, start_circle2_y, start_circle2_z], color });
+                        vertices.push(Vertex { position: [end_circle2_x, end_circle2_y, end_circle2_z], color });
+                        vertices.push(Vertex { position: [end_circle1_x, end_circle1_y, end_circle1_z], color });
+                    }
+                }
             }
         }
         
-        // Отрисовка суставов (круги в местах соединения костей)
+        // Отрисовка суставов (сферы в местах соединения костей)
         for joint in &creature.genome.joints {
-            let joint_x = x + joint.position.x * bone_scale;
-            let joint_y = y + joint.position.y * bone_scale;
-            let joint_radius = 0.02; // Фиксированный размер сустава в нормализованных координатах
-            let joint_segments = 12; // Больше сегментов для более гладкого круга
+            let joint_x = world_x + joint.position.x / 100.0;
+            let joint_y = world_y + joint.position.y / 100.0;
+            let joint_z = world_z + joint.position.z / 100.0;
+            let joint_radius = 0.08; // Размер сустава в мировых координатах
+            let segments = 8; // Количество сегментов для сферы
             
-            for i in 0..joint_segments {
-                let angle1 = (i as f32 / joint_segments as f32) * std::f32::consts::PI * 2.0;
-                let angle2 = ((i + 1) as f32 / joint_segments as f32) * std::f32::consts::PI * 2.0;
+            // Создаем сферу из треугольников
+            for i in 0..segments {
+                let theta1 = (i as f32 / segments as f32) * std::f32::consts::PI * 2.0;
+                let theta2 = ((i + 1) as f32 / segments as f32) * std::f32::consts::PI * 2.0;
                 
-                vertices.push(Vertex { position: [joint_x, joint_y], color });
-                vertices.push(Vertex { position: [joint_x + angle1.cos() * joint_radius, joint_y + angle1.sin() * joint_radius], color });
-                vertices.push(Vertex { position: [joint_x + angle2.cos() * joint_radius, joint_y + angle2.sin() * joint_radius], color });
+                for j in 0..segments {
+                    let phi1 = (j as f32 / segments as f32) * std::f32::consts::PI;
+                    let phi2 = ((j + 1) as f32 / segments as f32) * std::f32::consts::PI;
+                    
+                    // Вершины сферы
+                    let x1 = joint_x + joint_radius * phi1.sin() * theta1.cos();
+                    let y1 = joint_y + joint_radius * phi1.cos();
+                    let z1 = joint_z + joint_radius * phi1.sin() * theta1.sin();
+                    
+                    let x2 = joint_x + joint_radius * phi1.sin() * theta2.cos();
+                    let y2 = joint_y + joint_radius * phi1.cos();
+                    let z2 = joint_z + joint_radius * phi1.sin() * theta2.sin();
+                    
+                    let x3 = joint_x + joint_radius * phi2.sin() * theta1.cos();
+                    let y3 = joint_y + joint_radius * phi2.cos();
+                    let z3 = joint_z + joint_radius * phi2.sin() * theta1.sin();
+                    
+                    let x4 = joint_x + joint_radius * phi2.sin() * theta2.cos();
+                    let y4 = joint_y + joint_radius * phi2.cos();
+                    let z4 = joint_z + joint_radius * phi2.sin() * theta2.sin();
+                    
+                    // Два треугольника для сегмента сферы
+                    vertices.push(Vertex { position: [x1, y1, z1], color });
+                    vertices.push(Vertex { position: [x2, y2, z2], color });
+                    vertices.push(Vertex { position: [x3, y3, z3], color });
+                    
+                    vertices.push(Vertex { position: [x2, y2, z2], color });
+                    vertices.push(Vertex { position: [x4, y4, z4], color });
+                    vertices.push(Vertex { position: [x3, y3, z3], color });
+                }
             }
         }
         
@@ -1680,18 +2137,22 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 creature.genome.bones.get(muscle.bone1_id),
                 creature.genome.bones.get(muscle.bone2_id),
             ) {
-                // Вычисляем позиции точек прикрепления на костях
-                let bone1_start_x = x + bone1.position.x * bone_scale;
-                let bone1_start_y = y + bone1.position.y * bone_scale;
-                let bone1_length = bone1.length * bone_scale;
+                // Вычисляем позиции точек прикрепления на костях в мировых 3D координатах
+                let bone1_start_x = world_x + bone1.position.x / 100.0;
+                let bone1_start_y = world_y + bone1.position.y / 100.0;
+                let bone1_start_z = world_z + bone1.position.z / 100.0;
+                let bone1_length = bone1.length / 100.0;
                 let attach1_x = bone1_start_x + bone1.angle.cos() * bone1_length * muscle.attachment_point1;
                 let attach1_y = bone1_start_y + bone1.angle.sin() * bone1_length * muscle.attachment_point1;
+                let attach1_z = bone1_start_z;
                 
-                let bone2_start_x = x + bone2.position.x * bone_scale;
-                let bone2_start_y = y + bone2.position.y * bone_scale;
-                let bone2_length = bone2.length * bone_scale;
+                let bone2_start_x = world_x + bone2.position.x / 100.0;
+                let bone2_start_y = world_y + bone2.position.y / 100.0;
+                let bone2_start_z = world_z + bone2.position.z / 100.0;
+                let bone2_length = bone2.length / 100.0;
                 let attach2_x = bone2_start_x + bone2.angle.cos() * bone2_length * muscle.attachment_point2;
                 let attach2_y = bone2_start_y + bone2.angle.sin() * bone2_length * muscle.attachment_point2;
+                let attach2_z = bone2_start_z;
                 
                 // Цвет мышцы зависит от активации (используем правильный индекс)
                 let activation = if muscle_idx < creature.muscle_activations.len() {
@@ -1705,30 +2166,78 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     color[2] * 0.3 + activation * 0.7,
                 ];
                 
-                // Рисуем мышцу как линию с шириной
-                let muscle_width = 0.01; // Фиксированная ширина мышцы в нормализованных координатах
+                // Рисуем мышцу как цилиндр в 3D
+                let muscle_radius = 0.03; // Радиус мышцы в мировых координатах
+                let segments = 6; // Количество сегментов для цилиндра
                 let dx = attach2_x - attach1_x;
                 let dy = attach2_y - attach1_y;
-                let muscle_length = (dx * dx + dy * dy).sqrt();
+                let dz = attach2_z - attach1_z;
+                let muscle_length = (dx * dx + dy * dy + dz * dz).sqrt();
+                
                 if muscle_length > 0.0 {
-                    let perp_angle = dy.atan2(dx) + std::f32::consts::PI / 2.0;
+                    // Нормализуем направление
+                    let dir_x_norm = dx / muscle_length;
+                    let dir_y_norm = dy / muscle_length;
+                    let dir_z_norm = dz / muscle_length;
                     
-                    let p1_x = attach1_x + perp_angle.cos() * muscle_width;
-                    let p1_y = attach1_y + perp_angle.sin() * muscle_width;
-                    let p2_x = attach1_x - perp_angle.cos() * muscle_width;
-                    let p2_y = attach1_y - perp_angle.sin() * muscle_width;
-                    let p3_x = attach2_x + perp_angle.cos() * muscle_width;
-                    let p3_y = attach2_y + perp_angle.sin() * muscle_width;
-                    let p4_x = attach2_x - perp_angle.cos() * muscle_width;
-                    let p4_y = attach2_y - perp_angle.sin() * muscle_width;
+                    // Вычисляем перпендикулярные векторы для создания окружности
+                    let perp1 = if dir_y_norm.abs() < 0.9 {
+                        let cross_x = dir_y_norm;
+                        let cross_y = -dir_x_norm;
+                        let cross_z = 0.0;
+                        let cross_len = (cross_x * cross_x + cross_y * cross_y + cross_z * cross_z).sqrt();
+                        if cross_len > 0.0 {
+                            (cross_x / cross_len, cross_y / cross_len, cross_z / cross_len)
+                        } else {
+                            (1.0, 0.0, 0.0)
+                        }
+                    } else {
+                        (1.0, 0.0, 0.0)
+                    };
                     
-                    // Два треугольника для мышцы
-                    vertices.push(Vertex { position: [p1_x, p1_y], color: muscle_color });
-                    vertices.push(Vertex { position: [p2_x, p2_y], color: muscle_color });
-                    vertices.push(Vertex { position: [p3_x, p3_y], color: muscle_color });
-                    vertices.push(Vertex { position: [p2_x, p2_y], color: muscle_color });
-                    vertices.push(Vertex { position: [p4_x, p4_y], color: muscle_color });
-                    vertices.push(Vertex { position: [p3_x, p3_y], color: muscle_color });
+                    // Второй перпендикулярный вектор через векторное произведение
+                    let perp2_x = dir_y_norm * perp1.2 - dir_z_norm * perp1.1;
+                    let perp2_y = dir_z_norm * perp1.0 - dir_x_norm * perp1.2;
+                    let perp2_z = dir_x_norm * perp1.1 - dir_y_norm * perp1.0;
+                    let perp2_len = (perp2_x * perp2_x + perp2_y * perp2_y + perp2_z * perp2_z).sqrt();
+                    let perp2 = if perp2_len > 0.0 {
+                        (perp2_x / perp2_len, perp2_y / perp2_len, perp2_z / perp2_len)
+                    } else {
+                        (0.0, 0.0, 1.0)
+                    };
+                    
+                    // Создаем цилиндр из сегментов
+                    for i in 0..segments {
+                        let angle1 = (i as f32 / segments as f32) * std::f32::consts::PI * 2.0;
+                        let angle2 = ((i + 1) as f32 / segments as f32) * std::f32::consts::PI * 2.0;
+                        
+                        // Точки на окружности начала мышцы
+                        let start_circle1_x = attach1_x + (perp1.0 * angle1.cos() + perp2.0 * angle1.sin()) * muscle_radius;
+                        let start_circle1_y = attach1_y + (perp1.1 * angle1.cos() + perp2.1 * angle1.sin()) * muscle_radius;
+                        let start_circle1_z = attach1_z + (perp1.2 * angle1.cos() + perp2.2 * angle1.sin()) * muscle_radius;
+                        
+                        let start_circle2_x = attach1_x + (perp1.0 * angle2.cos() + perp2.0 * angle2.sin()) * muscle_radius;
+                        let start_circle2_y = attach1_y + (perp1.1 * angle2.cos() + perp2.1 * angle2.sin()) * muscle_radius;
+                        let start_circle2_z = attach1_z + (perp1.2 * angle2.cos() + perp2.2 * angle2.sin()) * muscle_radius;
+                        
+                        // Точки на окружности конца мышцы
+                        let end_circle1_x = attach2_x + (perp1.0 * angle1.cos() + perp2.0 * angle1.sin()) * muscle_radius;
+                        let end_circle1_y = attach2_y + (perp1.1 * angle1.cos() + perp2.1 * angle1.sin()) * muscle_radius;
+                        let end_circle1_z = attach2_z + (perp1.2 * angle1.cos() + perp2.2 * angle1.sin()) * muscle_radius;
+                        
+                        let end_circle2_x = attach2_x + (perp1.0 * angle2.cos() + perp2.0 * angle2.sin()) * muscle_radius;
+                        let end_circle2_y = attach2_y + (perp1.1 * angle2.cos() + perp2.1 * angle2.sin()) * muscle_radius;
+                        let end_circle2_z = attach2_z + (perp1.2 * angle2.cos() + perp2.2 * angle2.sin()) * muscle_radius;
+                        
+                        // Два треугольника для сегмента цилиндра
+                        vertices.push(Vertex { position: [start_circle1_x, start_circle1_y, start_circle1_z], color: muscle_color });
+                        vertices.push(Vertex { position: [start_circle2_x, start_circle2_y, start_circle2_z], color: muscle_color });
+                        vertices.push(Vertex { position: [end_circle1_x, end_circle1_y, end_circle1_z], color: muscle_color });
+                        
+                        vertices.push(Vertex { position: [start_circle2_x, start_circle2_y, start_circle2_z], color: muscle_color });
+                        vertices.push(Vertex { position: [end_circle2_x, end_circle2_y, end_circle2_z], color: muscle_color });
+                        vertices.push(Vertex { position: [end_circle1_x, end_circle1_y, end_circle1_z], color: muscle_color });
+                    }
                 }
             }
         }
@@ -1741,28 +2250,31 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let vision_color = [1.0, 1.0, 0.0]; // Желтый для зрения
                 let vision_alpha = sensor.development * 0.3;
                 
-                // Рисуем круг зрения (только контур)
+                // Рисуем круг зрения (только контур) в 3D
+                let vision_radius_3d = sensor.range / 100.0; // Радиус в мировых координатах
                 for i in 0..32 {
                     let angle1 = (i as f32 / 32.0) * std::f32::consts::PI * 2.0;
                     let angle2 = ((i + 1) as f32 / 32.0) * std::f32::consts::PI * 2.0;
                     
-                    let x1 = x + angle1.cos() * vision_radius;
-                    let y1 = y + angle1.sin() * vision_radius;
-                    let x2 = x + angle2.cos() * vision_radius;
-                    let y2 = y + angle2.sin() * vision_radius;
+                    let x1 = world_x + angle1.cos() * vision_radius_3d;
+                    let y1 = world_y + angle1.sin() * vision_radius_3d;
+                    let z1 = world_z;
+                    let x2 = world_x + angle2.cos() * vision_radius_3d;
+                    let y2 = world_y + angle2.sin() * vision_radius_3d;
+                    let z2 = world_z;
                     
                     // Тонкая линия
-                    let line_width = 0.002;
+                    let line_width = 0.01;
                     vertices.push(Vertex {
-                        position: [x1 - line_width, y1],
+                        position: [x1 - line_width, y1, z1],
                         color: [vision_color[0] * vision_alpha, vision_color[1] * vision_alpha, vision_color[2] * vision_alpha],
                     });
                     vertices.push(Vertex {
-                        position: [x1 + line_width, y1],
+                        position: [x1 + line_width, y1, z1],
                         color: [vision_color[0] * vision_alpha, vision_color[1] * vision_alpha, vision_color[2] * vision_alpha],
                     });
                     vertices.push(Vertex {
-                        position: [x2, y2],
+                        position: [x2, y2, z2],
                         color: [vision_color[0] * vision_alpha, vision_color[1] * vision_alpha, vision_color[2] * vision_alpha],
                     });
                 }
@@ -1774,40 +2286,41 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     fn create_food_vertices(&self, food: &Food) -> Vec<Vertex> {
         let mut vertices = Vec::new();
-        let radius = 10.0;
+        let radius = 0.1; // Радиус еды в мировых координатах
         let segments = 12;
         
         let color = [0.0, 1.0, 0.0]; // Зеленый цвет для еды
         
-        // Нормализуем позицию в координаты экрана (-1 до 1)
-        let x = (food.position.x / self.size.width as f32) * 2.0 - 1.0;
-        let y = 1.0 - (food.position.y / self.size.height as f32) * 2.0;
+        // Преобразуем позицию еды в мировые 3D координаты
+        let world_x = (food.position.x - self.size.width as f32 / 2.0) / 100.0;
+        let world_y = (food.position.y - self.size.height as f32 / 2.0) / 100.0;
+        let world_z = food.position.z;
         
-        // Создаем круг из треугольников
+        // Создаем круг из треугольников (в плоскости XY)
         for i in 0..segments {
             let angle1 = (i as f32 / segments as f32) * std::f32::consts::PI * 2.0;
             let angle2 = ((i + 1) as f32 / segments as f32) * std::f32::consts::PI * 2.0;
             
-            let radius_norm = radius / (self.size.width.min(self.size.height) as f32);
-            
             // Центр
             vertices.push(Vertex {
-                position: [x, y],
+                position: [world_x, world_y, world_z],
                 color: color,
             });
             // Первая точка на окружности
             vertices.push(Vertex {
                 position: [
-                    x + angle1.cos() * radius_norm,
-                    y + angle1.sin() * radius_norm,
+                    world_x + angle1.cos() * radius,
+                    world_y + angle1.sin() * radius,
+                    world_z,
                 ],
                 color: color,
             });
             // Вторая точка на окружности
             vertices.push(Vertex {
                 position: [
-                    x + angle2.cos() * radius_norm,
-                    y + angle2.sin() * radius_norm,
+                    world_x + angle2.cos() * radius,
+                    world_y + angle2.sin() * radius,
+                    world_z,
                 ],
                 color: color,
             });
@@ -1855,12 +2368,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         
         // Фон ползунка (темно-серый)
         let bg_color = [0.3, 0.3, 0.3];
-        vertices.push(Vertex { position: [x1, y1], color: bg_color });
-        vertices.push(Vertex { position: [x2, y1], color: bg_color });
-        vertices.push(Vertex { position: [x1, y2], color: bg_color });
-        vertices.push(Vertex { position: [x2, y1], color: bg_color });
-        vertices.push(Vertex { position: [x2, y2], color: bg_color });
-        vertices.push(Vertex { position: [x1, y2], color: bg_color });
+        let ui_z = 0.0; // UI элементы рендерятся в плоскости XY с z=0 для ортогональной проекции
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x2, y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x2, y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x2, y2, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: bg_color });
         
         // Индикатор текущего значения (зеленый)
         let indicator_pos = ((self.time_scale - 1.0) / 499.0).min(1.0).max(0.0); // 0..1 для диапазона 1-500
@@ -1868,12 +2382,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let indicator_width = 0.01;
         let indicator_color = [0.0, 1.0, 0.0];
         
-        vertices.push(Vertex { position: [indicator_x - indicator_width, y1], color: indicator_color });
-        vertices.push(Vertex { position: [indicator_x + indicator_width, y1], color: indicator_color });
-        vertices.push(Vertex { position: [indicator_x - indicator_width, y2], color: indicator_color });
-        vertices.push(Vertex { position: [indicator_x + indicator_width, y1], color: indicator_color });
-        vertices.push(Vertex { position: [indicator_x + indicator_width, y2], color: indicator_color });
-        vertices.push(Vertex { position: [indicator_x - indicator_width, y2], color: indicator_color });
+        vertices.push(Vertex { position: [indicator_x - indicator_width, y1, ui_z], color: indicator_color });
+        vertices.push(Vertex { position: [indicator_x + indicator_width, y1, ui_z], color: indicator_color });
+        vertices.push(Vertex { position: [indicator_x - indicator_width, y2, ui_z], color: indicator_color });
+        vertices.push(Vertex { position: [indicator_x + indicator_width, y1, ui_z], color: indicator_color });
+        vertices.push(Vertex { position: [indicator_x + indicator_width, y2, ui_z], color: indicator_color });
+        vertices.push(Vertex { position: [indicator_x - indicator_width, y2, ui_z], color: indicator_color });
         
         vertices
     }
@@ -1889,9 +2403,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let spacing = 28.0;
         let legend_size = 12.0; // Размер цветных квадратиков легенды
         
-        // Нормализуем координаты
+        // Нормализуем координаты в NDC (-1..1) для ортогональной проекции
         let x1 = (stats_x / self.size.width as f32) * 2.0 - 1.0;
         let x2 = ((stats_x + bar_width) / self.size.width as f32) * 2.0 - 1.0;
+        let ui_z = 0.0; // UI элементы рендерятся в плоскости XY с z=0
         
         // Фон для статистики (темный с рамкой)
         let bg_x1 = x1 - 0.025;
@@ -1899,44 +2414,44 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let bg_y1 = 1.0 - ((stats_y - 8.0) / self.size.height as f32) * 2.0;
         let bg_y2 = 1.0 - ((stats_y + spacing * 5.5 + 8.0) / self.size.height as f32) * 2.0;
         let bg_color = [0.1, 0.1, 0.1];
-        vertices.push(Vertex { position: [bg_x1, bg_y1], color: bg_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y1], color: bg_color });
-        vertices.push(Vertex { position: [bg_x1, bg_y2], color: bg_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y1], color: bg_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y2], color: bg_color });
-        vertices.push(Vertex { position: [bg_x1, bg_y2], color: bg_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y2, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y2, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y2, ui_z], color: bg_color });
         
         // Рамка вокруг статистики
         let border_color = [0.5, 0.5, 0.5];
         let border_width = 0.003;
         // Верх
-        vertices.push(Vertex { position: [bg_x1, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x1, bg_y1 + border_width], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y1 + border_width], color: border_color });
-        vertices.push(Vertex { position: [bg_x1, bg_y1 + border_width], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y1 + border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y1 + border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y1 + border_width, ui_z], color: border_color });
         // Низ
-        vertices.push(Vertex { position: [bg_x1, bg_y2 - border_width], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y2 - border_width], color: border_color });
-        vertices.push(Vertex { position: [bg_x1, bg_y2], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y2 - border_width], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y2], color: border_color });
-        vertices.push(Vertex { position: [bg_x1, bg_y2], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y2 - border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y2 - border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y2 - border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y2, ui_z], color: border_color });
         // Лево
-        vertices.push(Vertex { position: [bg_x1, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x1 + border_width, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x1, bg_y2], color: border_color });
-        vertices.push(Vertex { position: [bg_x1 + border_width, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x1 + border_width, bg_y2], color: border_color });
-        vertices.push(Vertex { position: [bg_x1, bg_y2], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1 + border_width, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1 + border_width, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1 + border_width, bg_y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x1, bg_y2, ui_z], color: border_color });
         // Право
-        vertices.push(Vertex { position: [bg_x2 - border_width, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x2 - border_width, bg_y2], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y1], color: border_color });
-        vertices.push(Vertex { position: [bg_x2, bg_y2], color: border_color });
-        vertices.push(Vertex { position: [bg_x2 - border_width, bg_y2], color: border_color });
+        vertices.push(Vertex { position: [bg_x2 - border_width, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2 - border_width, bg_y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2, bg_y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [bg_x2 - border_width, bg_y2, ui_z], color: border_color });
         
         // Легенда (цветные квадратики слева от полос)
         let legend_x = x1 - 0.04;
@@ -1954,20 +2469,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Легенда (квадратик)
         let legend_y1 = y_center - legend_size_norm;
         let legend_y2 = y_center + legend_size_norm;
-        vertices.push(Vertex { position: [legend_x, legend_y1], color: species_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: species_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: species_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: species_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2], color: species_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: species_color });
+        vertices.push(Vertex { position: [legend_x, legend_y1, ui_z], color: species_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: species_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: species_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: species_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2, ui_z], color: species_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: species_color });
         
         // Полоса
-        vertices.push(Vertex { position: [x1, y1], color: species_color });
-        vertices.push(Vertex { position: [species_x2, y1], color: species_color });
-        vertices.push(Vertex { position: [x1, y2], color: species_color });
-        vertices.push(Vertex { position: [species_x2, y1], color: species_color });
-        vertices.push(Vertex { position: [species_x2, y2], color: species_color });
-        vertices.push(Vertex { position: [x1, y2], color: species_color });
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: species_color });
+        vertices.push(Vertex { position: [species_x2, y1, ui_z], color: species_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: species_color });
+        vertices.push(Vertex { position: [species_x2, y1, ui_z], color: species_color });
+        vertices.push(Vertex { position: [species_x2, y2, ui_z], color: species_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: species_color });
         
         // Популяция (синий)
         y_offset += spacing;
@@ -1981,20 +2496,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Легенда
         let legend_y1 = y_center - legend_size_norm;
         let legend_y2 = y_center + legend_size_norm;
-        vertices.push(Vertex { position: [legend_x, legend_y1], color: pop_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: pop_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: pop_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: pop_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2], color: pop_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: pop_color });
+        vertices.push(Vertex { position: [legend_x, legend_y1, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: pop_color });
         
         // Полоса
-        vertices.push(Vertex { position: [x1, y1], color: pop_color });
-        vertices.push(Vertex { position: [pop_x2, y1], color: pop_color });
-        vertices.push(Vertex { position: [x1, y2], color: pop_color });
-        vertices.push(Vertex { position: [pop_x2, y1], color: pop_color });
-        vertices.push(Vertex { position: [pop_x2, y2], color: pop_color });
-        vertices.push(Vertex { position: [x1, y2], color: pop_color });
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [pop_x2, y1, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [pop_x2, y1, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [pop_x2, y2, ui_z], color: pop_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: pop_color });
         
         // Средняя энергия (зеленый)
         y_offset += spacing;
@@ -2008,20 +2523,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Легенда
         let legend_y1 = y_center - legend_size_norm;
         let legend_y2 = y_center + legend_size_norm;
-        vertices.push(Vertex { position: [legend_x, legend_y1], color: energy_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: energy_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: energy_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: energy_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2], color: energy_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: energy_color });
+        vertices.push(Vertex { position: [legend_x, legend_y1, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: energy_color });
         
         // Полоса
-        vertices.push(Vertex { position: [x1, y1], color: energy_color });
-        vertices.push(Vertex { position: [energy_x2, y1], color: energy_color });
-        vertices.push(Vertex { position: [x1, y2], color: energy_color });
-        vertices.push(Vertex { position: [energy_x2, y1], color: energy_color });
-        vertices.push(Vertex { position: [energy_x2, y2], color: energy_color });
-        vertices.push(Vertex { position: [x1, y2], color: energy_color });
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [energy_x2, y1, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [energy_x2, y1, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [energy_x2, y2, ui_z], color: energy_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: energy_color });
         
         // Еда (желтый)
         y_offset += spacing;
@@ -2035,20 +2550,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Легенда
         let legend_y1 = y_center - legend_size_norm;
         let legend_y2 = y_center + legend_size_norm;
-        vertices.push(Vertex { position: [legend_x, legend_y1], color: food_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: food_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: food_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: food_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2], color: food_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: food_color });
+        vertices.push(Vertex { position: [legend_x, legend_y1, ui_z], color: food_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: food_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: food_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: food_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2, ui_z], color: food_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: food_color });
         
         // Полоса
-        vertices.push(Vertex { position: [x1, y1], color: food_color });
-        vertices.push(Vertex { position: [food_x2, y1], color: food_color });
-        vertices.push(Vertex { position: [x1, y2], color: food_color });
-        vertices.push(Vertex { position: [food_x2, y1], color: food_color });
-        vertices.push(Vertex { position: [food_x2, y2], color: food_color });
-        vertices.push(Vertex { position: [x1, y2], color: food_color });
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: food_color });
+        vertices.push(Vertex { position: [food_x2, y1, ui_z], color: food_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: food_color });
+        vertices.push(Vertex { position: [food_x2, y1, ui_z], color: food_color });
+        vertices.push(Vertex { position: [food_x2, y2, ui_z], color: food_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: food_color });
         
         // Скорость времени (белый)
         y_offset += spacing;
@@ -2062,20 +2577,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Легенда
         let legend_y1 = y_center - legend_size_norm;
         let legend_y2 = y_center + legend_size_norm;
-        vertices.push(Vertex { position: [legend_x, legend_y1], color: time_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: time_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: time_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1], color: time_color });
-        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2], color: time_color });
-        vertices.push(Vertex { position: [legend_x, legend_y2], color: time_color });
+        vertices.push(Vertex { position: [legend_x, legend_y1, ui_z], color: time_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: time_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: time_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y1, ui_z], color: time_color });
+        vertices.push(Vertex { position: [legend_x + legend_size_norm * 2.0, legend_y2, ui_z], color: time_color });
+        vertices.push(Vertex { position: [legend_x, legend_y2, ui_z], color: time_color });
         
         // Полоса
-        vertices.push(Vertex { position: [x1, y1], color: time_color });
-        vertices.push(Vertex { position: [time_x2, y1], color: time_color });
-        vertices.push(Vertex { position: [x1, y2], color: time_color });
-        vertices.push(Vertex { position: [time_x2, y1], color: time_color });
-        vertices.push(Vertex { position: [time_x2, y2], color: time_color });
-        vertices.push(Vertex { position: [x1, y2], color: time_color });
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: time_color });
+        vertices.push(Vertex { position: [time_x2, y1, ui_z], color: time_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: time_color });
+        vertices.push(Vertex { position: [time_x2, y1, ui_z], color: time_color });
+        vertices.push(Vertex { position: [time_x2, y2, ui_z], color: time_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: time_color });
         
         vertices
     }
@@ -2098,15 +2613,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let x2 = ((graph_x + graph_width) / self.size.width as f32) * 2.0 - 1.0;
         let y1 = 1.0 - ((graph_y + graph_height) / self.size.height as f32) * 2.0;
         let y2 = 1.0 - (graph_y / self.size.height as f32) * 2.0;
+        let ui_z = 0.0; // UI элементы рендерятся в плоскости XY с z=0 для ортогональной проекции
         
         // Фон графика (темный)
         let bg_color = [0.15, 0.15, 0.15];
-        vertices.push(Vertex { position: [x1, y1], color: bg_color });
-        vertices.push(Vertex { position: [x2, y1], color: bg_color });
-        vertices.push(Vertex { position: [x1, y2], color: bg_color });
-        vertices.push(Vertex { position: [x2, y1], color: bg_color });
-        vertices.push(Vertex { position: [x2, y2], color: bg_color });
-        vertices.push(Vertex { position: [x1, y2], color: bg_color });
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x2, y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x2, y1, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x2, y2, ui_z], color: bg_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: bg_color });
         
         // Сетка графика (светло-серые линии)
         let grid_color = [0.3, 0.3, 0.3];
@@ -2114,22 +2630,22 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Горизонтальные линии (5 линий)
         for i in 0..=5 {
             let grid_y = y1 + (y2 - y1) * (i as f32 / 5.0);
-            vertices.push(Vertex { position: [x1, grid_y], color: grid_color });
-            vertices.push(Vertex { position: [x2, grid_y], color: grid_color });
-            vertices.push(Vertex { position: [x1, grid_y + grid_line_width], color: grid_color });
-            vertices.push(Vertex { position: [x2, grid_y], color: grid_color });
-            vertices.push(Vertex { position: [x2, grid_y + grid_line_width], color: grid_color });
-            vertices.push(Vertex { position: [x1, grid_y + grid_line_width], color: grid_color });
+            vertices.push(Vertex { position: [x1, grid_y, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [x2, grid_y, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [x1, grid_y + grid_line_width, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [x2, grid_y, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [x2, grid_y + grid_line_width, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [x1, grid_y + grid_line_width, ui_z], color: grid_color });
         }
         // Вертикальные линии (10 линий)
         for i in 0..=10 {
             let grid_x = x1 + (x2 - x1) * (i as f32 / 10.0);
-            vertices.push(Vertex { position: [grid_x, y1], color: grid_color });
-            vertices.push(Vertex { position: [grid_x, y2], color: grid_color });
-            vertices.push(Vertex { position: [grid_x + grid_line_width, y1], color: grid_color });
-            vertices.push(Vertex { position: [grid_x, y2], color: grid_color });
-            vertices.push(Vertex { position: [grid_x + grid_line_width, y2], color: grid_color });
-            vertices.push(Vertex { position: [grid_x + grid_line_width, y1], color: grid_color });
+            vertices.push(Vertex { position: [grid_x, y1, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [grid_x, y2, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [grid_x + grid_line_width, y1, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [grid_x, y2, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [grid_x + grid_line_width, y2, ui_z], color: grid_color });
+            vertices.push(Vertex { position: [grid_x + grid_line_width, y1, ui_z], color: grid_color });
         }
         
         // Находим максимумы для нормализации
@@ -2151,12 +2667,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let dx = perp_angle.cos() * line_width;
             let dy = perp_angle.sin() * line_width;
             
-            vertices.push(Vertex { position: [x1_val + dx, y1_val + dy], color: species_color });
-            vertices.push(Vertex { position: [x1_val - dx, y1_val - dy], color: species_color });
-            vertices.push(Vertex { position: [x2_val + dx, y2_val + dy], color: species_color });
-            vertices.push(Vertex { position: [x1_val - dx, y1_val - dy], color: species_color });
-            vertices.push(Vertex { position: [x2_val - dx, y2_val - dy], color: species_color });
-            vertices.push(Vertex { position: [x2_val + dx, y2_val + dy], color: species_color });
+            vertices.push(Vertex { position: [x1_val + dx, y1_val + dy, ui_z], color: species_color });
+            vertices.push(Vertex { position: [x1_val - dx, y1_val - dy, ui_z], color: species_color });
+            vertices.push(Vertex { position: [x2_val + dx, y2_val + dy, ui_z], color: species_color });
+            vertices.push(Vertex { position: [x1_val - dx, y1_val - dy, ui_z], color: species_color });
+            vertices.push(Vertex { position: [x2_val - dx, y2_val - dy, ui_z], color: species_color });
+            vertices.push(Vertex { position: [x2_val + dx, y2_val + dy, ui_z], color: species_color });
         }
         
         // График популяции (синий, более толстая линия)
@@ -2172,45 +2688,45 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let dx = perp_angle.cos() * line_width;
             let dy = perp_angle.sin() * line_width;
             
-            vertices.push(Vertex { position: [x1_val + dx, y1_val + dy], color: pop_color });
-            vertices.push(Vertex { position: [x1_val - dx, y1_val - dy], color: pop_color });
-            vertices.push(Vertex { position: [x2_val + dx, y2_val + dy], color: pop_color });
-            vertices.push(Vertex { position: [x1_val - dx, y1_val - dy], color: pop_color });
-            vertices.push(Vertex { position: [x2_val - dx, y2_val - dy], color: pop_color });
-            vertices.push(Vertex { position: [x2_val + dx, y2_val + dy], color: pop_color });
+            vertices.push(Vertex { position: [x1_val + dx, y1_val + dy, ui_z], color: pop_color });
+            vertices.push(Vertex { position: [x1_val - dx, y1_val - dy, ui_z], color: pop_color });
+            vertices.push(Vertex { position: [x2_val + dx, y2_val + dy, ui_z], color: pop_color });
+            vertices.push(Vertex { position: [x1_val - dx, y1_val - dy, ui_z], color: pop_color });
+            vertices.push(Vertex { position: [x2_val - dx, y2_val - dy, ui_z], color: pop_color });
+            vertices.push(Vertex { position: [x2_val + dx, y2_val + dy, ui_z], color: pop_color });
         }
         
         // Граница графика (белая рамка)
         let border_color = [0.9, 0.9, 0.9];
         let border_width = 0.003;
         // Верх
-        vertices.push(Vertex { position: [x1, y1], color: border_color });
-        vertices.push(Vertex { position: [x2, y1], color: border_color });
-        vertices.push(Vertex { position: [x1, y1 + border_width], color: border_color });
-        vertices.push(Vertex { position: [x2, y1], color: border_color });
-        vertices.push(Vertex { position: [x2, y1 + border_width], color: border_color });
-        vertices.push(Vertex { position: [x1, y1 + border_width], color: border_color });
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1, y1 + border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y1 + border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1, y1 + border_width, ui_z], color: border_color });
         // Низ
-        vertices.push(Vertex { position: [x1, y2 - border_width], color: border_color });
-        vertices.push(Vertex { position: [x2, y2 - border_width], color: border_color });
-        vertices.push(Vertex { position: [x1, y2], color: border_color });
-        vertices.push(Vertex { position: [x2, y2 - border_width], color: border_color });
-        vertices.push(Vertex { position: [x2, y2], color: border_color });
-        vertices.push(Vertex { position: [x1, y2], color: border_color });
+        vertices.push(Vertex { position: [x1, y2 - border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y2 - border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y2 - border_width, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: border_color });
         // Лево
-        vertices.push(Vertex { position: [x1, y1], color: border_color });
-        vertices.push(Vertex { position: [x1 + border_width, y1], color: border_color });
-        vertices.push(Vertex { position: [x1, y2], color: border_color });
-        vertices.push(Vertex { position: [x1 + border_width, y1], color: border_color });
-        vertices.push(Vertex { position: [x1 + border_width, y2], color: border_color });
-        vertices.push(Vertex { position: [x1, y2], color: border_color });
+        vertices.push(Vertex { position: [x1, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1 + border_width, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1 + border_width, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1 + border_width, y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x1, y2, ui_z], color: border_color });
         // Право
-        vertices.push(Vertex { position: [x2 - border_width, y1], color: border_color });
-        vertices.push(Vertex { position: [x2, y1], color: border_color });
-        vertices.push(Vertex { position: [x2 - border_width, y2], color: border_color });
-        vertices.push(Vertex { position: [x2, y1], color: border_color });
-        vertices.push(Vertex { position: [x2, y2], color: border_color });
-        vertices.push(Vertex { position: [x2 - border_width, y2], color: border_color });
+        vertices.push(Vertex { position: [x2 - border_width, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2 - border_width, y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y1, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2, y2, ui_z], color: border_color });
+        vertices.push(Vertex { position: [x2 - border_width, y2, ui_z], color: border_color });
         
         vertices
     }

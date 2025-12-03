@@ -1,10 +1,10 @@
-use cgmath::Point2;
+use cgmath::Point3;
 
 pub struct Creature {
     pub id: u64,
     pub species_id: u32,
-    pub position: Point2<f32>,
-    pub velocity: cgmath::Vector2<f32>,
+    pub position: Point3<f32>,
+    pub velocity: cgmath::Vector3<f32>,
     pub energy: f32,
     pub energy_storage: f32,
     pub age: f32,
@@ -37,7 +37,7 @@ pub struct Bone {
     pub length: f32,
     pub width: f32,
     pub mass: f32, // Масса кости
-    pub position: cgmath::Point2<f32>, // Позиция начала кости (относительно существа)
+    pub position: cgmath::Point3<f32>, // Позиция начала кости (относительно существа)
     pub angle: f32, // Угол кости относительно существа
     pub parent_bone_id: Option<usize>, // Родительская кость (для построения скелета)
 }
@@ -90,7 +90,7 @@ pub struct MetabolismGenes {
 }
 
 impl Creature {
-    pub fn new(id: u64, species_id: u32, position: Point2<f32>) -> Self {
+    pub fn new(id: u64, species_id: u32, position: Point3<f32>) -> Self {
         let genome = Genome::default();
         let muscle_count = genome.muscles.len();
         
@@ -106,7 +106,7 @@ impl Creature {
             id,
             species_id,
             position,
-            velocity: cgmath::Vector2::new(0.0, 0.0),
+            velocity: cgmath::Vector3::new(0.0, 0.0, 0.0),
             energy: 100.0,
             energy_storage: 0.0,
             age: 0.0,
@@ -202,7 +202,7 @@ impl Default for Genome {
             length: 1.0,
             width: 0.3,
             mass: 10.0,
-            position: Point2::new(0.0, 0.0),
+            position: Point3::new(0.0, 0.0, 0.0),
             angle: 0.0,
             parent_bone_id: None,
         };
@@ -213,7 +213,7 @@ impl Default for Genome {
             length: 0.5,
             width: 0.1,
             mass: 2.0,
-            position: Point2::new(0.0, -0.5), // Под туловищем
+            position: Point3::new(0.0, -0.5, 0.0), // Под туловищем
             angle: std::f32::consts::PI / 2.0, // Вертикально вниз
             parent_bone_id: Some(0),
         };
@@ -232,7 +232,7 @@ impl Default for Genome {
                 min_angle: -std::f32::consts::PI / 3.0, // -60 градусов
                 max_angle: std::f32::consts::PI / 3.0,  // +60 градусов
             },
-            position: Point2::new(0.0, -0.5),
+            position: Point3::new(0.0, -0.5, 0.0),
         };
         
         let joints = vec![joint];

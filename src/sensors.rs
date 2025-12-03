@@ -104,7 +104,7 @@ pub enum SmellType {
 }
 
 impl VisionSensor {
-    pub fn sense(&self, position: cgmath::Point2<f32>, angle: f32) -> VisionData {
+    pub fn sense(&self, position: cgmath::Point3<f32>, angle: f32) -> VisionData {
         // Это заглушка - реальная реализация требует доступа к другим объектам
         // В реальной реализации здесь будет raycasting для обнаружения объектов
         VisionData {
@@ -119,10 +119,10 @@ impl VisionSensor {
     
     pub fn sense_with_objects(
         &self,
-        position: cgmath::Point2<f32>,
+        position: cgmath::Point3<f32>,
         angle: f32,
-        foods: &[(cgmath::Point2<f32>, bool)],
-        creatures: &[(cgmath::Point2<f32>, u32)],
+        foods: &[(cgmath::Point3<f32>, bool)],
+        creatures: &[(cgmath::Point3<f32>, u32)],
         arena_size: (f32, f32),
     ) -> VisionData {
         let mut rays = Vec::new();
@@ -130,7 +130,7 @@ impl VisionSensor {
         
         for i in 0..self.ray_count {
             let ray_angle = angle - self.angle_of_view / 2.0 + (i as f32 * angle_step);
-            let direction = cgmath::Vector2::new(ray_angle.cos(), ray_angle.sin());
+            let direction = cgmath::Vector3::new(ray_angle.cos(), ray_angle.sin(), 0.0);
             
             let mut closest_hit = RayHit {
                 distance: self.range,
@@ -165,8 +165,8 @@ impl VisionSensor {
                 let to_food = *food_pos - position;
                 let dist_to_center = (to_food.x * to_food.x + to_food.y * to_food.y).sqrt();
                 if dist_to_center < 10.0 && dist_to_center > 0.0 {
-                    let to_food_norm = cgmath::Vector2::new(to_food.x / dist_to_center, to_food.y / dist_to_center);
-                    let dot = direction.x * to_food_norm.x + direction.y * to_food_norm.y;
+                    let to_food_norm = cgmath::Vector3::new(to_food.x / dist_to_center, to_food.y / dist_to_center, to_food.z / dist_to_center);
+                    let dot = direction.x * to_food_norm.x + direction.y * to_food_norm.y + direction.z * to_food_norm.z;
                     if dot > 0.9 {
                         let hit_dist = dist_to_center - 5.0;
                         if hit_dist < closest_hit.distance && hit_dist > 0.0 {
@@ -184,8 +184,8 @@ impl VisionSensor {
                 let to_creature = *creature_pos - position;
                 let dist_to_center = (to_creature.x * to_creature.x + to_creature.y * to_creature.y).sqrt();
                 if dist_to_center < 30.0 && dist_to_center > 0.0 {
-                    let to_creature_norm = cgmath::Vector2::new(to_creature.x / dist_to_center, to_creature.y / dist_to_center);
-                    let dot = direction.x * to_creature_norm.x + direction.y * to_creature_norm.y;
+                    let to_creature_norm = cgmath::Vector3::new(to_creature.x / dist_to_center, to_creature.y / dist_to_center, to_creature.z / dist_to_center);
+                    let dot = direction.x * to_creature_norm.x + direction.y * to_creature_norm.y + direction.z * to_creature_norm.z;
                     if dot > 0.9 {
                         let hit_dist = dist_to_center - 15.0;
                         if hit_dist < closest_hit.distance && hit_dist > 0.0 {
@@ -206,7 +206,7 @@ impl VisionSensor {
 }
 
 impl HearingSensor {
-    pub fn sense(&self, position: cgmath::Point2<f32>) -> HearingData {
+    pub fn sense(&self, position: cgmath::Point3<f32>) -> HearingData {
         HearingData {
             sounds: vec![],
         }
@@ -214,14 +214,14 @@ impl HearingSensor {
     
     pub fn sense_with_sounds(
         &self,
-        position: cgmath::Point2<f32>,
-        sounds: &[(cgmath::Point2<f32>, f32, SoundType)],
+        position: cgmath::Point3<f32>,
+        sounds: &[(cgmath::Point3<f32>, f32, SoundType)],
     ) -> HearingData {
         let mut detected_sounds = Vec::new();
         
         for (sound_pos, volume, sound_type) in sounds {
             let to_sound = *sound_pos - position;
-            let distance = (to_sound.x * to_sound.x + to_sound.y * to_sound.y).sqrt();
+            let distance = (to_sound.x * to_sound.x + to_sound.y * to_sound.y + to_sound.z * to_sound.z).sqrt();
             
             if distance <= self.range {
                 let attenuation = 1.0 / (1.0 + distance / 50.0);
@@ -252,7 +252,7 @@ impl HearingSensor {
 }
 
 impl TouchSensor {
-    pub fn sense(&self, _position: cgmath::Point2<f32>) -> TouchData {
+    pub fn sense(&self, _position: cgmath::Point3<f32>) -> TouchData {
         TouchData {
             contacts: vec![],
         }
@@ -260,7 +260,7 @@ impl TouchSensor {
 }
 
 impl SmellSensor {
-    pub fn sense(&self, position: cgmath::Point2<f32>) -> SmellData {
+    pub fn sense(&self, position: cgmath::Point3<f32>) -> SmellData {
         SmellData {
             smells: vec![],
         }
@@ -268,14 +268,14 @@ impl SmellSensor {
     
     pub fn sense_with_sources(
         &self,
-        position: cgmath::Point2<f32>,
-        smell_sources: &[(cgmath::Point2<f32>, f32, SmellType)],
+        position: cgmath::Point3<f32>,
+        smell_sources: &[(cgmath::Point3<f32>, f32, SmellType)],
     ) -> SmellData {
         let mut detected_smells = Vec::new();
         
         for (smell_pos, intensity, smell_type) in smell_sources {
             let to_smell = *smell_pos - position;
-            let distance = (to_smell.x * to_smell.x + to_smell.y * to_smell.y).sqrt();
+            let distance = (to_smell.x * to_smell.x + to_smell.y * to_smell.y + to_smell.z * to_smell.z).sqrt();
             
             if distance <= self.range {
                 // Диффузия запаха: концентрация уменьшается с расстоянием

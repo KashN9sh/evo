@@ -12,7 +12,7 @@ pub struct Joint {
     pub bone2_id: usize, // Вторая кость
     pub angle: f32, // Текущий угол между костями
     pub ligament: Ligament, // Связка, ограничивающая движение
-    pub position: cgmath::Point2<f32>, // Позиция сустава (точка соединения костей)
+    pub position: cgmath::Point3<f32>, // Позиция сустава (точка соединения костей)
 }
 
 #[derive(Clone)]
@@ -63,8 +63,8 @@ impl Biomechanics {
         creature: &Creature,
         muscle_activations: &[f32],
         dt: f32,
-    ) -> cgmath::Vector2<f32> {
-        let mut total_force = cgmath::Vector2::new(0.0, 0.0);
+    ) -> cgmath::Vector3<f32> {
+        let mut total_force = cgmath::Vector3::new(0.0, 0.0, 0.0);
         
         // Рассчитываем силу от каждой мышцы
         for (i, activation) in muscle_activations.iter().enumerate() {
@@ -88,6 +88,7 @@ impl Biomechanics {
                         
                         total_force.x += force_angle.cos() * force_magnitude;
                         total_force.y += force_angle.sin() * force_magnitude;
+                        total_force.z = 0.0; // Движение в плоскости XY
                     }
                 }
             }

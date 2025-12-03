@@ -1,13 +1,13 @@
-use cgmath::Point2;
+use cgmath::Point3;
 
 pub struct Food {
-    pub position: Point2<f32>,
+    pub position: Point3<f32>,
     pub energy_value: f32,
     pub is_eaten: bool,
 }
 
 impl Food {
-    pub fn new(position: Point2<f32>, energy_value: f32) -> Self {
+    pub fn new(position: Point3<f32>, energy_value: f32) -> Self {
         Self {
             position,
             energy_value,
@@ -51,7 +51,7 @@ impl FoodSystem {
             let x = rng.gen_range(10.0..(arena_size.0 - 10.0));
             let y = rng.gen_range(10.0..(arena_size.1 - 10.0));
             self.foods.push(Food::new(
-                Point2::new(x, y),
+                Point3::new(x, y, 0.0),
                 rng.gen_range(30.0..60.0),
             ));
         }

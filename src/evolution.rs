@@ -352,9 +352,10 @@ impl EvolutionSystem {
                 length: 0.3 + rng.gen::<f32>() * 0.4,
                 width: 0.05 + rng.gen::<f32>() * 0.1,
                 mass: 1.0 + rng.gen::<f32>() * 2.0,
-                position: cgmath::Point2::new(
+                position: cgmath::Point3::new(
                     rng.gen::<f32>() * 0.5 - 0.25,
                     rng.gen::<f32>() * 0.5 - 0.25,
+                    0.0,
                 ),
                 angle: rng.gen::<f32>() * std::f32::consts::PI * 2.0,
                 parent_bone_id: parent_id,
