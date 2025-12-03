@@ -1,4 +1,5 @@
-use crate::creature::{Creature, Genome, SensorGene, SensorType, BodyParts, Muscle, MetabolismGenes};
+use crate::creature::{Creature, Genome, SensorGene, SensorType, Muscle, MetabolismGenes, Bone};
+use crate::biomechanics::{Joint, Ligament};
 use crate::neural::{self, ConnectionGene, NodeGene, NodeType, ActivationFunction};
 use rand::Rng;
 
@@ -73,13 +74,27 @@ impl EvolutionSystem {
 
         let neural_compatibility = c1 * excess as f32 / n + c2 * disjoint as f32 / n + c3 * weight_diff / matching.max(1) as f32;
         
-        // Добавляем различия в частях тела
+        // Добавляем различия в структуре костей и суставов
         let body_diff = {
-            let size_diff = (genome1.body_parts.torso.size - genome2.body_parts.torso.size).abs();
-            let shape_diff = (genome1.body_parts.torso.shape - genome2.body_parts.torso.shape).abs();
-            let legs_diff = (genome1.body_parts.legs.len() as f32 - genome2.body_parts.legs.len() as f32).abs();
-            let arms_diff = (genome1.body_parts.arms.len() as f32 - genome2.body_parts.arms.len() as f32).abs();
-            size_diff + shape_diff * 0.5 + legs_diff * 0.3 + arms_diff * 0.2
+            let bones_diff = (genome1.bones.len() as f32 - genome2.bones.len() as f32).abs();
+            let joints_diff = (genome1.joints.len() as f32 - genome2.joints.len() as f32).abs();
+            
+            let mut bones_param_diff = 0.0;
+            let min_bones = genome1.bones.len().min(genome2.bones.len());
+            for i in 0..min_bones {
+                bones_param_diff += (genome1.bones[i].length - genome2.bones[i].length).abs();
+                bones_param_diff += (genome1.bones[i].width - genome2.bones[i].width).abs();
+                bones_param_diff += (genome1.bones[i].mass - genome2.bones[i].mass).abs() * 0.1;
+            }
+            
+            let mut joints_param_diff = 0.0;
+            let min_joints = genome1.joints.len().min(genome2.joints.len());
+            for i in 0..min_joints {
+                joints_param_diff += (genome1.joints[i].ligament.stiffness - genome2.joints[i].ligament.stiffness).abs() * 0.1;
+                joints_param_diff += (genome1.joints[i].ligament.damping - genome2.joints[i].ligament.damping).abs();
+            }
+            
+            bones_diff * 0.5 + joints_diff * 0.3 + bones_param_diff * 0.1 + joints_param_diff * 0.1
         };
         
         // Добавляем различия в органах чувств
@@ -145,13 +160,13 @@ impl EvolutionSystem {
             self.mutate_sensors(genome, rng);
         }
         
-        // Мутации частей тела
-        if rng.gen::<f32>() < self.mutation_rate * 0.5 {
+        // Мутации частей тела (увеличена частота)
+        if rng.gen::<f32>() < self.mutation_rate * 0.8 {
             self.mutate_body_parts(genome, rng);
         }
         
-        // Мутации мышц
-        if rng.gen::<f32>() < self.mutation_rate * 0.4 {
+        // Мутации мышц (увеличена частота)
+        if rng.gen::<f32>() < self.mutation_rate * 0.7 {
             self.mutate_muscles(genome, rng);
         }
         
@@ -287,128 +302,183 @@ impl EvolutionSystem {
     }
     
     fn mutate_body_parts(&self, genome: &mut Genome, rng: &mut impl Rng) {
-        // Мутация размера туловища
-        if rng.gen::<f32>() < 0.8 {
-            genome.body_parts.torso.size += rng.gen::<f32>() * 0.5 - 0.25;
-            genome.body_parts.torso.size = genome.body_parts.torso.size.max(0.5).min(3.0);
-        }
-        
-        // Мутация формы туловища
-        if rng.gen::<f32>() < 0.6 {
-            genome.body_parts.torso.shape += rng.gen::<f32>() * 0.3 - 0.15;
-            genome.body_parts.torso.shape = genome.body_parts.torso.shape.clamp(0.0, 1.0);
-        }
-        
-        // Мутация цвета (небольшие изменения)
-        if rng.gen::<f32>() < 0.5 {
-            for i in 0..3 {
-                genome.body_parts.torso.color[i] += rng.gen::<f32>() * 0.2 - 0.1;
-                genome.body_parts.torso.color[i] = genome.body_parts.torso.color[i].clamp(0.0, 1.0);
+        // Мутация костей: изменение параметров существующих костей
+        for bone in &mut genome.bones {
+            if rng.gen::<f32>() < 0.6 {
+                bone.length += rng.gen::<f32>() * 0.2 - 0.1;
+                bone.length = bone.length.max(0.1).min(2.0);
             }
-        }
-        
-        // Мутация ног: добавление/удаление ноги
-        if rng.gen::<f32>() < 0.4 {
-            if rng.gen::<f32>() < 0.5 && genome.body_parts.legs.len() < 6 {
-                // Добавить ногу
-                genome.body_parts.legs.push(crate::creature::Leg {
-                    segments: vec![crate::creature::Segment {
-                        length: 0.3 + rng.gen::<f32>() * 0.4,
-                        width: 0.05 + rng.gen::<f32>() * 0.1,
-                    }],
-                    position: rng.gen::<f32>() * std::f32::consts::PI * 2.0,
-                });
-            } else if genome.body_parts.legs.len() > 1 {
-                // Удалить ногу
-                let idx = rng.gen_range(0..genome.body_parts.legs.len());
-                genome.body_parts.legs.remove(idx);
+            if rng.gen::<f32>() < 0.5 {
+                bone.width += rng.gen::<f32>() * 0.05 - 0.025;
+                bone.width = bone.width.max(0.02).min(0.5);
             }
-        }
-        
-        // Мутация параметров ног
-        if rng.gen::<f32>() < 0.7 && !genome.body_parts.legs.is_empty() {
-            let leg_idx = rng.gen_range(0..genome.body_parts.legs.len());
-            let leg = &mut genome.body_parts.legs[leg_idx];
-            
-            // Добавить/удалить сегмент
+            if rng.gen::<f32>() < 0.4 {
+                bone.mass += rng.gen::<f32>() * 1.0 - 0.5;
+                bone.mass = bone.mass.max(0.5).min(20.0);
+            }
             if rng.gen::<f32>() < 0.3 {
-                if rng.gen::<f32>() < 0.5 && leg.segments.len() < 4 {
-                    leg.segments.push(crate::creature::Segment {
-                        length: 0.3 + rng.gen::<f32>() * 0.3,
-                        width: 0.05 + rng.gen::<f32>() * 0.08,
-                    });
-                } else if leg.segments.len() > 1 {
-                    let seg_idx = rng.gen_range(0..leg.segments.len());
-                    leg.segments.remove(seg_idx);
+                bone.angle += rng.gen::<f32>() * 0.3 - 0.15;
+            }
+        }
+        
+        // Мутация суставов: изменение параметров связок
+        for joint in &mut genome.joints {
+            if rng.gen::<f32>() < 0.5 {
+                joint.ligament.stiffness += rng.gen::<f32>() * 2.0 - 1.0;
+                joint.ligament.stiffness = joint.ligament.stiffness.max(1.0).min(20.0);
+            }
+            if rng.gen::<f32>() < 0.4 {
+                joint.ligament.damping += rng.gen::<f32>() * 0.2 - 0.1;
+                joint.ligament.damping = joint.ligament.damping.max(0.1).min(1.0);
+            }
+            if rng.gen::<f32>() < 0.3 {
+                let range_change = rng.gen::<f32>() * 0.5 - 0.25;
+                joint.ligament.min_angle += range_change;
+                joint.ligament.max_angle += range_change;
+            }
+        }
+        
+        // Добавление новой кости (увеличена вероятность)
+        if rng.gen::<f32>() < 0.6 && genome.bones.len() < 15 {
+            let parent_id = if genome.bones.len() > 0 {
+                Some(rng.gen_range(0..genome.bones.len()))
+            } else {
+                None
+            };
+            
+            let new_bone_id = genome.bones.len();
+            let new_bone = Bone {
+                id: new_bone_id,
+                length: 0.3 + rng.gen::<f32>() * 0.4,
+                width: 0.05 + rng.gen::<f32>() * 0.1,
+                mass: 1.0 + rng.gen::<f32>() * 2.0,
+                position: cgmath::Point2::new(
+                    rng.gen::<f32>() * 0.5 - 0.25,
+                    rng.gen::<f32>() * 0.5 - 0.25,
+                ),
+                angle: rng.gen::<f32>() * std::f32::consts::PI * 2.0,
+                parent_bone_id: parent_id,
+            };
+            
+            genome.bones.push(new_bone);
+            
+            // ВСЕГДА создаем сустав между новой костью и родительской (если есть родитель)
+            if let Some(parent_id) = parent_id {
+                let joint = Joint {
+                    id: genome.joints.len(),
+                    bone1_id: parent_id,
+                    bone2_id: new_bone_id,
+                    angle: 0.0,
+                    ligament: Ligament {
+                        stiffness: 8.0 + rng.gen::<f32>() * 4.0,
+                        damping: 0.3 + rng.gen::<f32>() * 0.3,
+                        min_angle: -std::f32::consts::PI / 3.0,
+                        max_angle: std::f32::consts::PI / 3.0,
+                    },
+                    position: genome.bones[parent_id].position,
+                };
+                genome.joints.push(joint);
+            }
+        }
+        
+        // Также можем добавить новый сустав между существующими костями (если его еще нет)
+        if rng.gen::<f32>() < 0.3 && genome.bones.len() >= 2 && genome.joints.len() < genome.bones.len() * 2 {
+            let bone1_id = rng.gen_range(0..genome.bones.len());
+            let bone2_id = rng.gen_range(0..genome.bones.len());
+            
+            if bone1_id != bone2_id {
+                // Проверяем, нет ли уже сустава между этими костями
+                let joint_exists = genome.joints.iter().any(|j| 
+                    (j.bone1_id == bone1_id && j.bone2_id == bone2_id) ||
+                    (j.bone1_id == bone2_id && j.bone2_id == bone1_id)
+                );
+                
+                if !joint_exists {
+                    let joint = Joint {
+                        id: genome.joints.len(),
+                        bone1_id,
+                        bone2_id,
+                        angle: 0.0,
+                        ligament: Ligament {
+                            stiffness: 8.0 + rng.gen::<f32>() * 4.0,
+                            damping: 0.3 + rng.gen::<f32>() * 0.3,
+                            min_angle: -std::f32::consts::PI / 3.0,
+                            max_angle: std::f32::consts::PI / 3.0,
+                        },
+                        position: genome.bones[bone1_id].position,
+                    };
+                    genome.joints.push(joint);
                 }
             }
-            
-            // Изменить параметры сегментов
-            for segment in &mut leg.segments {
-                segment.length += rng.gen::<f32>() * 0.2 - 0.1;
-                segment.length = segment.length.max(0.1).min(1.0);
-                segment.width += rng.gen::<f32>() * 0.05 - 0.025;
-                segment.width = segment.width.max(0.02).min(0.3);
-            }
         }
         
-        // Мутация рук: добавление/удаление руки
-        if rng.gen::<f32>() < 0.3 {
-            if rng.gen::<f32>() < 0.5 && genome.body_parts.arms.len() < 4 {
-                // Добавить руку
-                genome.body_parts.arms.push(crate::creature::Arm {
-                    segments: vec![crate::creature::Segment {
-                        length: 0.2 + rng.gen::<f32>() * 0.3,
-                        width: 0.04 + rng.gen::<f32>() * 0.08,
-                    }],
-                    position: rng.gen::<f32>() * std::f32::consts::PI * 2.0,
-                });
-            } else if !genome.body_parts.arms.is_empty() {
-                // Удалить руку
-                let idx = rng.gen_range(0..genome.body_parts.arms.len());
-                genome.body_parts.arms.remove(idx);
-            }
-        }
-        
-        // Мутация параметров рук
-        if rng.gen::<f32>() < 0.6 && !genome.body_parts.arms.is_empty() {
-            let arm_idx = rng.gen_range(0..genome.body_parts.arms.len());
-            let arm = &mut genome.body_parts.arms[arm_idx];
-            
-            // Добавить/удалить сегмент
-            if rng.gen::<f32>() < 0.3 {
-                if rng.gen::<f32>() < 0.5 && arm.segments.len() < 3 {
-                    arm.segments.push(crate::creature::Segment {
-                        length: 0.2 + rng.gen::<f32>() * 0.25,
-                        width: 0.04 + rng.gen::<f32>() * 0.06,
-                    });
-                } else if arm.segments.len() > 1 {
-                    let seg_idx = rng.gen_range(0..arm.segments.len());
-                    arm.segments.remove(seg_idx);
-                }
-            }
-            
-            // Изменить параметры сегментов
-            for segment in &mut arm.segments {
-                segment.length += rng.gen::<f32>() * 0.15 - 0.075;
-                segment.length = segment.length.max(0.1).min(0.8);
-                segment.width += rng.gen::<f32>() * 0.04 - 0.02;
-                segment.width = segment.width.max(0.02).min(0.25);
-            }
+        // Удаление кости (очень редко, только если костей много)
+        if rng.gen::<f32>() < 0.1 && genome.bones.len() > 2 {
+            let idx = rng.gen_range(1..genome.bones.len()); // Не удаляем корневую кость
+            genome.bones.remove(idx);
+            // Удаляем связанные суставы и мышцы
+            genome.joints.retain(|j| j.bone1_id != idx && j.bone2_id != idx);
+            genome.muscles.retain(|m| m.bone1_id != idx && m.bone2_id != idx);
         }
     }
     
     fn mutate_muscles(&self, genome: &mut Genome, rng: &mut impl Rng) {
-        // Добавить/удалить мышцу
-        if rng.gen::<f32>() < 0.4 {
-            if rng.gen::<f32>() < 0.5 && genome.muscles.len() < 5 {
-                // Добавить мышцу
-                genome.muscles.push(Muscle {
-                    strength: 0.5 + rng.gen::<f32>() * 1.0,
-                    speed: 0.5 + rng.gen::<f32>() * 1.0,
-                    efficiency: 0.2 + rng.gen::<f32>() * 0.3,
-                    endurance: 0.5 + rng.gen::<f32>() * 1.0,
-                });
+        // Добавить/удалить мышцу (увеличена вероятность добавления)
+        if rng.gen::<f32>() < 0.7 {
+            if rng.gen::<f32>() < 0.8 && genome.muscles.len() < 20 {
+                // Пытаемся добавить мышцу через существующий сустав
+                if genome.joints.len() > 0 {
+                    let joint_idx = rng.gen_range(0..genome.joints.len());
+                    let joint = &genome.joints[joint_idx];
+                    
+                    genome.muscles.push(Muscle {
+                        strength: 0.5 + rng.gen::<f32>() * 1.0,
+                        speed: 0.5 + rng.gen::<f32>() * 1.0,
+                        efficiency: 0.2 + rng.gen::<f32>() * 0.3,
+                        endurance: 0.5 + rng.gen::<f32>() * 1.0,
+                        bone1_id: joint.bone1_id,
+                        bone2_id: joint.bone2_id,
+                        joint_id: joint.id,
+                        attachment_point1: rng.gen::<f32>(),
+                        attachment_point2: rng.gen::<f32>(),
+                    });
+                } else if genome.bones.len() >= 2 {
+                    // Если нет суставов, но есть кости - создаем новый сустав и мышцу
+                    let bone1_id = rng.gen_range(0..genome.bones.len());
+                    let bone2_id = rng.gen_range(0..genome.bones.len());
+                    
+                    if bone1_id != bone2_id {
+                        // Создаем новый сустав
+                        let new_joint_id = genome.joints.len();
+                        let joint = Joint {
+                            id: new_joint_id,
+                            bone1_id,
+                            bone2_id,
+                            angle: 0.0,
+                            ligament: Ligament {
+                                stiffness: 8.0 + rng.gen::<f32>() * 4.0,
+                                damping: 0.3 + rng.gen::<f32>() * 0.3,
+                                min_angle: -std::f32::consts::PI / 3.0,
+                                max_angle: std::f32::consts::PI / 3.0,
+                            },
+                            position: genome.bones[bone1_id].position,
+                        };
+                        genome.joints.push(joint);
+                        
+                        // Создаем мышцу через новый сустав
+                        genome.muscles.push(Muscle {
+                            strength: 0.5 + rng.gen::<f32>() * 1.0,
+                            speed: 0.5 + rng.gen::<f32>() * 1.0,
+                            efficiency: 0.2 + rng.gen::<f32>() * 0.3,
+                            endurance: 0.5 + rng.gen::<f32>() * 1.0,
+                            bone1_id,
+                            bone2_id,
+                            joint_id: new_joint_id,
+                            attachment_point1: rng.gen::<f32>(),
+                            attachment_point2: rng.gen::<f32>(),
+                        });
+                    }
+                }
             } else if genome.muscles.len() > 1 {
                 // Удалить мышцу
                 let idx = rng.gen_range(0..genome.muscles.len());
@@ -432,6 +502,16 @@ impl EvolutionSystem {
             
             muscle.endurance += rng.gen::<f32>() * 0.3 - 0.15;
             muscle.endurance = muscle.endurance.max(0.1).min(3.0);
+            
+            // Мутация точек прикрепления
+            if rng.gen::<f32>() < 0.3 {
+                muscle.attachment_point1 += rng.gen::<f32>() * 0.2 - 0.1;
+                muscle.attachment_point1 = muscle.attachment_point1.clamp(0.0, 1.0);
+            }
+            if rng.gen::<f32>() < 0.3 {
+                muscle.attachment_point2 += rng.gen::<f32>() * 0.2 - 0.1;
+                muscle.attachment_point2 = muscle.attachment_point2.clamp(0.0, 1.0);
+            }
         }
     }
     
@@ -511,8 +591,9 @@ impl EvolutionSystem {
             }
         }
 
-        // Скрещивание частей тела - среднее между родителями
-        child.body_parts = Self::crossover_body_parts(&parent1.body_parts, &parent2.body_parts, rng);
+        // Скрещивание костей и суставов - среднее между родителями
+        child.bones = Self::crossover_bones(&parent1.bones, &parent2.bones, rng);
+        child.joints = Self::crossover_joints(&parent1.joints, &parent2.joints, rng);
         
         // Скрещивание мышц - среднее между родителями
         child.muscles = Self::crossover_muscles(&parent1.muscles, &parent2.muscles, rng);
@@ -526,29 +607,71 @@ impl EvolutionSystem {
         child
     }
 
-    fn crossover_body_parts(parent1: &BodyParts, parent2: &BodyParts, rng: &mut impl Rng) -> BodyParts {
-        // Среднее между родителями
-        BodyParts {
-            torso: crate::creature::Torso {
-                size: (parent1.torso.size + parent2.torso.size) / 2.0,
-                shape: (parent1.torso.shape + parent2.torso.shape) / 2.0,
-                color: [
-                    (parent1.torso.color[0] + parent2.torso.color[0]) / 2.0,
-                    (parent1.torso.color[1] + parent2.torso.color[1]) / 2.0,
-                    (parent1.torso.color[2] + parent2.torso.color[2]) / 2.0,
-                ],
-            },
-            legs: if rng.gen::<f32>() < 0.5 {
-                parent1.legs.clone()
-            } else {
-                parent2.legs.clone()
-            },
-            arms: if rng.gen::<f32>() < 0.5 {
-                parent1.arms.clone()
-            } else {
-                parent2.arms.clone()
-            },
+    fn crossover_bones(parent1: &Vec<Bone>, parent2: &Vec<Bone>, rng: &mut impl Rng) -> Vec<Bone> {
+        // Выбираем родителя с меньшим количеством костей или случайного
+        let (source, other) = if parent1.len() <= parent2.len() {
+            (parent1, parent2)
+        } else {
+            (parent2, parent1)
+        };
+        
+        let mut result = source.clone();
+        
+        // Добавляем недостающие кости от другого родителя (если есть)
+        if result.len() < other.len() && rng.gen::<f32>() < 0.5 {
+            for i in result.len()..other.len() {
+                if i < other.len() {
+                    let mut bone = other[i].clone();
+                    bone.id = result.len();
+                    result.push(bone);
+                }
+            }
         }
+        
+        // Смешиваем параметры костей
+        let min_len = result.len().min(other.len());
+        for i in 0..min_len {
+            if rng.gen::<f32>() < 0.5 {
+                result[i].length = (result[i].length + other[i].length) / 2.0;
+                result[i].width = (result[i].width + other[i].width) / 2.0;
+                result[i].mass = (result[i].mass + other[i].mass) / 2.0;
+            }
+        }
+        
+        result
+    }
+    
+    fn crossover_joints(parent1: &Vec<Joint>, parent2: &Vec<Joint>, rng: &mut impl Rng) -> Vec<Joint> {
+        // Выбираем родителя с меньшим количеством суставов или случайного
+        let (source, other) = if parent1.len() <= parent2.len() {
+            (parent1, parent2)
+        } else {
+            (parent2, parent1)
+        };
+        
+        let mut result = source.clone();
+        
+        // Добавляем недостающие суставы от другого родителя (если есть)
+        if result.len() < other.len() && rng.gen::<f32>() < 0.5 {
+            for i in result.len()..other.len() {
+                if i < other.len() {
+                    let mut joint = other[i].clone();
+                    joint.id = result.len();
+                    result.push(joint);
+                }
+            }
+        }
+        
+        // Смешиваем параметры связок
+        let min_len = result.len().min(other.len());
+        for i in 0..min_len {
+            if rng.gen::<f32>() < 0.5 {
+                result[i].ligament.stiffness = (result[i].ligament.stiffness + other[i].ligament.stiffness) / 2.0;
+                result[i].ligament.damping = (result[i].ligament.damping + other[i].ligament.damping) / 2.0;
+            }
+        }
+        
+        result
     }
 
     fn crossover_muscles(parent1: &Vec<Muscle>, parent2: &Vec<Muscle>, rng: &mut impl Rng) -> Vec<Muscle> {
@@ -567,23 +690,23 @@ impl EvolutionSystem {
                         speed: (m1.speed + m2.speed) / 2.0,
                         efficiency: (m1.efficiency + m2.efficiency) / 2.0,
                         endurance: (m1.endurance + m2.endurance) / 2.0,
+                        bone1_id: m1.bone1_id,
+                        bone2_id: m1.bone2_id,
+                        joint_id: m1.joint_id,
+                        attachment_point1: (m1.attachment_point1 + m2.attachment_point1) / 2.0,
+                        attachment_point2: (m1.attachment_point2 + m2.attachment_point2) / 2.0,
                     });
                 }
                 (Some(m), None) | (None, Some(m)) => {
-                    result.push(m.clone());
+                    result.push(m.clone()); // Клонируем мышцу со всеми полями
                 }
                 (None, None) => {}
             }
         }
         
         if result.is_empty() {
-            // Если нет мышц, создаем одну базовую
-            result.push(Muscle {
-                strength: 1.0,
-                speed: 1.0,
-                efficiency: 0.3,
-                endurance: 1.0,
-            });
+            // Если нет мышц, создаем одну базовую (требует наличия костей и суставов)
+            // Это должно быть обработано на уровне выше
         }
         
         result

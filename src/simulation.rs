@@ -359,7 +359,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     fn initialize_population(&mut self) {
         let mut rng = rand::thread_rng();
-        let initial_count = 50;
+        let initial_count = 1;
         
         for i in 0..initial_count {
             let x = rng.gen_range(100.0..1180.0);
@@ -575,7 +575,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 }
                 
                 if energy <= 0.0 {
-                    return Some((idx, creature_pos, creature_velocity, 0.0, age, false, None));
+                    // Возвращаем пустые суставы и активацию мышц при смерти
+                    return Some((idx, creature_pos, creature_velocity, 0.0, age, false, None, creature.joint_states.clone(), creature.muscle_activations.clone()));
                 }
                 
                 // Находим ближайшую еду (оптимизировано: ограничиваем радиус поиска)
@@ -775,42 +776,92 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     }
                 }
                 
+                // Добавляем входы для состояния суставов (для обучения ходьбе)
+                let joint_inputs_start = inputs.len();
+                for joint_state in &creature.joint_states {
+                    // Находим соответствующий сустав в геноме
+                    if let Some(joint) = creature.genome.joints.iter().find(|j| j.id == joint_state.joint_id) {
+                        // Нормализуем угол сустава в диапазон 0-1
+                        let normalized_angle = (joint_state.angle - joint.ligament.min_angle) / (joint.ligament.max_angle - joint.ligament.min_angle);
+                        inputs.push(normalized_angle);
+                    }
+                }
+                
+                // Добавляем входы для текущей активации мышц (обратная связь)
+                for activation in &creature.muscle_activations {
+                    inputs.push(*activation);
+                }
+                
                 // Вычисляем выходы нейросети
                 let mut network = Network::new(&creature.genome.neural_network);
                 let outputs = network.forward(&inputs);
                 
-                // Базовое движение к еде или партнеру
-                let mut target_velocity = cgmath::Vector2::new(0.0, 0.0);
-                
-                if food_proximity > 0.0 {
-                    let base_speed = 1.5;
-                    target_velocity.x = food_direction_x * base_speed;
-                    target_velocity.y = food_direction_y * base_speed;
-                } else if nearest_partner_distance < 150.0 && nearest_partner_distance > 0.0 {
-                    let base_speed = 1.0;
-                    target_velocity.x = (nearest_partner_dx / nearest_partner_distance) * base_speed;
-                    target_velocity.y = (nearest_partner_dy / nearest_partner_distance) * base_speed;
-                } else {
-                    let angle = (creature_id as f32 * 137.508 + time_snapshot * 0.5) % (std::f32::consts::PI * 2.0);
-                    let base_speed = 0.5;
-                    target_velocity.x = angle.cos() * base_speed;
-                    target_velocity.y = angle.sin() * base_speed;
+                // Используем выходы для активации мышц
+                let mut muscle_activations = vec![0.0; creature.genome.muscles.len()];
+                for (i, output) in outputs.iter().enumerate() {
+                    if i < muscle_activations.len() {
+                        muscle_activations[i] = output.max(0.0).min(1.0); // Ограничиваем 0-1
+                    }
                 }
                 
-                // Комбинируем нейросеть и базовое движение
-                let neural_speed = if outputs.len() > 1 { outputs[1].max(0.0) * 2.0 } else { 0.0 };
-                let neural_angle = if outputs.len() > 0 { outputs[0] * std::f32::consts::PI * 2.0 } else { 0.0 };
+                // Если выходов меньше чем мышц, заполняем остальные нулями
+                // Если выходов больше, игнорируем лишние
                 
-                let neural_velocity = cgmath::Vector2::new(
-                    neural_angle.cos() * neural_speed,
-                    neural_angle.sin() * neural_speed,
+                // Используем выходы для управления суставами (если есть дополнительные выходы)
+                let mut joint_target_angles = Vec::new();
+                let muscle_output_count = muscle_activations.len();
+                for (i, joint_state) in creature.joint_states.iter().enumerate() {
+                    if let Some(joint) = creature.genome.joints.iter().find(|j| j.id == joint_state.joint_id) {
+                        let output_idx = muscle_output_count + i;
+                        if output_idx < outputs.len() {
+                            // Преобразуем выход (0-1) в целевой угол сустава
+                            let normalized_target = outputs[output_idx].max(0.0).min(1.0);
+                            let target_angle = joint.ligament.min_angle + normalized_target * (joint.ligament.max_angle - joint.ligament.min_angle);
+                            joint_target_angles.push(target_angle);
+                        } else {
+                            // Если нет выхода для сустава, используем текущий угол
+                            joint_target_angles.push(joint_state.angle);
+                        }
+                    }
+                }
+                
+                // Обновляем углы суставов на основе целевых углов
+                let mut updated_joint_states = creature.joint_states.clone();
+                for (i, target_angle) in joint_target_angles.iter().enumerate() {
+                    if i < updated_joint_states.len() {
+                        let joint_state = &mut updated_joint_states[i];
+                        if let Some(joint) = creature.genome.joints.iter().find(|j| j.id == joint_state.joint_id) {
+                            // Применяем ограничения связки
+                            let clamped_target = target_angle.max(joint.ligament.min_angle).min(joint.ligament.max_angle);
+                            let angle_error = clamped_target - joint_state.angle;
+                            let torque = angle_error * joint.ligament.stiffness;
+                            let angular_velocity = torque - joint_state.angle * joint.ligament.damping;
+                            joint_state.angle += angular_velocity * dt;
+                            joint_state.angle = joint_state.angle.max(joint.ligament.min_angle).min(joint.ligament.max_angle);
+                        }
+                    }
+                }
+                
+                // Рассчитываем движение на основе активации мышц и углов суставов
+                let muscle_force = biomechanics_snapshot.calculate_movement_from_muscles(
+                    creature,
+                    &muscle_activations,
+                    dt,
                 );
                 
-                // Если есть еда, приоритет базовому движению к еде (оно правильное)
-                // Если еды нет, больше полагаемся на нейросеть
-                let base_weight = if food_proximity > 0.0 { 0.8 } else { 0.3 };
-                let neural_weight = 1.0 - base_weight;
-                let mut new_vel = target_velocity * base_weight + neural_velocity * neural_weight;
+                // Применяем силу к скорости (F = ma, но упрощенно: F = m*v/t)
+                let mass = biomechanics_snapshot.calculate_mass(creature);
+                let acceleration = if mass > 0.0 {
+                    cgmath::Vector2::new(muscle_force.x / mass, muscle_force.y / mass)
+                } else {
+                    cgmath::Vector2::new(0.0, 0.0)
+                };
+                
+                // Обновляем скорость ТОЛЬКО на основе активации мышц
+                // Нейросеть получает информацию о еде как входы, но движение полностью контролируется мышцами
+                let mut new_vel = creature_velocity;
+                new_vel.x += acceleration.x * dt;
+                new_vel.y += acceleration.y * dt;
                 
                 // Применяем трение
                 let friction_coeff = biomechanics_snapshot.friction_coefficient;
@@ -834,40 +885,56 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 new_pos.x += new_vel.x * dt;
                 new_pos.y += new_vel.y * dt;
                 
-                // Проверяем границы
-                let radius = 15.0 + creature.genome.body_parts.torso.size * 10.0;
-                if new_pos.x < radius {
-                    new_pos.x = radius;
+                // Проверяем границы на основе реальных размеров костей
+                // Вычисляем максимальное расстояние от центра до края костей (bounding radius)
+                let mut max_distance: f32 = 5.0; // Минимальный размер для столкновений
+                for bone in &creature.genome.bones {
+                    // Расстояние от центра до начала кости
+                    let dist_to_start: f32 = (bone.position.x * bone.position.x + bone.position.y * bone.position.y).sqrt();
+                    // Расстояние от центра до конца кости
+                    let bone_end_x: f32 = bone.position.x + bone.angle.cos() * bone.length;
+                    let bone_end_y: f32 = bone.position.y + bone.angle.sin() * bone.length;
+                    let dist_to_end: f32 = (bone_end_x * bone_end_x + bone_end_y * bone_end_y).sqrt();
+                    // Максимальное расстояние с учетом ширины кости
+                    let max_dist: f32 = dist_to_start.max(dist_to_end) + bone.width;
+                    max_distance = max_distance.max(max_dist);
+                }
+                
+                let collision_radius = max_distance;
+                if new_pos.x < collision_radius {
+                    new_pos.x = collision_radius;
                     new_vel.x = 0.0;
                 }
-                if new_pos.x > physics_snapshot.arena_size.0 - radius {
-                    new_pos.x = physics_snapshot.arena_size.0 - radius;
+                if new_pos.x > physics_snapshot.arena_size.0 - collision_radius {
+                    new_pos.x = physics_snapshot.arena_size.0 - collision_radius;
                     new_vel.x = 0.0;
                 }
-                if new_pos.y < radius {
-                    new_pos.y = radius;
+                if new_pos.y < collision_radius {
+                    new_pos.y = collision_radius;
                     new_vel.y = 0.0;
                 }
-                if new_pos.y > physics_snapshot.arena_size.1 - radius {
-                    new_pos.y = physics_snapshot.arena_size.1 - radius;
+                if new_pos.y > physics_snapshot.arena_size.1 - collision_radius {
+                    new_pos.y = physics_snapshot.arena_size.1 - collision_radius;
                     new_vel.y = 0.0;
                 }
                 
                 // Пытаемся съесть еду
                 let ate_food = nearest_food_distance < 30.0 && nearest_food_idx.is_some();
                 
-                Some((idx, new_pos, new_vel, energy, age, ate_food, nearest_food_idx))
+                Some((idx, new_pos, new_vel, energy, age, ate_food, nearest_food_idx, updated_joint_states, muscle_activations))
             })
             .collect();
         
         // Применяем вычисленные изменения к существам (синхронно)
-        for (creature_idx, new_pos, new_vel, new_energy, new_age, ate_food, food_idx) in creature_updates {
+        for (creature_idx, new_pos, new_vel, new_energy, new_age, ate_food, food_idx, updated_joint_states, muscle_activations) in creature_updates {
             if creature_idx < self.creatures.len() {
                 let creature = &mut self.creatures[creature_idx];
                 creature.position = new_pos;
                 creature.velocity = new_vel;
                 creature.energy = new_energy;
                 creature.age = new_age;
+                creature.joint_states = updated_joint_states;
+                creature.muscle_activations = muscle_activations;
                 
                 if new_energy <= 0.0 {
                     creature.is_alive = false;
@@ -921,11 +988,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         
         // УДАЛЕНО: дублирование генерации звуков и запахов (уже делается выше в параллельном коде)
         
+        // Сохраняем геном последнего существа перед удалением для перерождения
+        let last_genome = self.creatures.first().map(|c| c.genome.clone());
+        let last_species_id = self.creatures.first().map(|c| c.species_id);
+        
         // Удаляем мертвых существ
         self.creatures.retain(|c| c.is_alive);
         
         // Если слишком много существ, убиваем самых слабых
-        const MAX_CREATURES: usize = 20; // Максимальное количество существ
+        const MAX_CREATURES: usize = 1; // Максимальное количество существ
         if self.creatures.len() > MAX_CREATURES {
             // Используем частичную сортировку для производительности
             let to_remove = self.creatures.len() - MAX_CREATURES;
@@ -938,6 +1009,44 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 }
             }
             self.creatures.retain(|c| c.is_alive);
+        }
+        
+        // Перерождение: если популяция пуста, создаем новое существо с мутациями
+        if self.creatures.is_empty() {
+            let evolution_system = crate::evolution::EvolutionSystem::new();
+            let mut rng = rand::thread_rng();
+            
+            // Создаем новый геном на основе последнего (если был) или базовый
+            let mut new_genome = if let Some(genome) = last_genome {
+                // Мутируем геном умершего существа
+                let mut mutated_genome = genome;
+                evolution_system.mutate(&mut mutated_genome, &mut rng);
+                mutated_genome
+            } else {
+                // Создаем новый базовый геном
+                crate::creature::Genome::default()
+            };
+            
+            // Дополнительные мутации для перерождения (более агрессивные)
+            evolution_system.mutate(&mut new_genome, &mut rng);
+            
+            // Создаем новое существо в случайной позиции
+            let x = rng.gen_range(100.0..1180.0);
+            let y = rng.gen_range(100.0..620.0);
+            
+            let species_id = last_species_id.unwrap_or(self.next_species_id);
+            
+            let mut new_creature = Creature::new(
+                self.next_creature_id,
+                species_id,
+                cgmath::Point2::new(x, y),
+            );
+            new_creature.genome = new_genome;
+            new_creature.energy = 100.0;
+            new_creature.initialize_joints_and_muscles();
+            
+            self.creatures.push(new_creature);
+            self.next_creature_id += 1;
         }
         
         self.update_species_map();
@@ -1071,7 +1180,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Используем time_scale для масштабирования вероятности размножения
         let time_scale = self.time_scale;
         // Ограничиваем размножение, если уже много существ
-        const MAX_CREATURES: usize = 500;
+        const MAX_CREATURES: usize = 1;
         if self.creatures.len() >= MAX_CREATURES {
             return;
         }
@@ -1191,6 +1300,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     );
                     child.genome = child_genome;
                     child.energy = 100.0;
+                    child.initialize_joints_and_muscles();
                     
                     new_creatures.push(child);
                     self.next_creature_id += 1;
@@ -1495,11 +1605,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     fn create_creature_vertices(&self, creature: &Creature) -> Vec<Vertex> {
         let mut vertices = Vec::new();
         
-        // Размер существа зависит от размера туловища
-        let base_radius = 15.0 + creature.genome.body_parts.torso.size * 10.0;
-        let radius = base_radius;
-        let segments = 20; // Больше сегментов для более гладкого круга
-        
         // Цвет по виду (простая хеш-функция для генерации цвета)
         let hue = (creature.species_id as f32 * 137.508) % 1.0;
         let mut color = self.hsv_to_rgb(hue, 0.8, 0.9);
@@ -1510,158 +1615,120 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color[1] = color[1] * 0.4 + color[1] * energy_factor * 0.6;
         color[2] = color[2] * 0.4 + color[2] * energy_factor * 0.6;
         
-        // Добавляем обводку для лучшей видимости
-        let outline_color = [color[0] * 0.5, color[1] * 0.5, color[2] * 0.5];
-        
         // Нормализуем позицию в координаты экрана (-1 до 1)
         let x = (creature.position.x / self.size.width as f32) * 2.0 - 1.0;
         let y = 1.0 - (creature.position.y / self.size.height as f32) * 2.0;
         
-        // Создаем туловище (форма зависит от shape параметра)
-        let radius_norm = radius / (self.size.width.min(self.size.height) as f32);
-        let shape_factor = creature.genome.body_parts.torso.shape;
+        // Масштаб для рендеринга костей (преобразуем размеры костей в нормализованные координаты)
+        // Используем фиксированный масштаб для видимости
+        let bone_scale = 0.003; // Масштаб для преобразования размеров костей
         
-        // Обводка туловища (немного больше)
-        let outline_radius = radius_norm * 1.1;
-        let outline_radius_x = outline_radius * (1.0 + shape_factor * 0.5);
-        let outline_radius_y = outline_radius * (1.0 - shape_factor * 0.3);
-        
-        for i in 0..segments {
-            let angle1 = (i as f32 / segments as f32) * std::f32::consts::PI * 2.0;
-            let angle2 = ((i + 1) as f32 / segments as f32) * std::f32::consts::PI * 2.0;
-            
-            // Форма туловища: от круга (shape=0) до овала (shape=1)
-            let radius_x = radius_norm * (1.0 + shape_factor * 0.5);
-            let radius_y = radius_norm * (1.0 - shape_factor * 0.3);
-            
-            // Обводка (внешний круг)
-            vertices.push(Vertex {
-                position: [x, y],
-                color: outline_color,
-            });
-            vertices.push(Vertex {
-                position: [
-                    x + angle1.cos() * outline_radius_x,
-                    y + angle1.sin() * outline_radius_y,
-                ],
-                color: outline_color,
-            });
-            vertices.push(Vertex {
-                position: [
-                    x + angle2.cos() * outline_radius_x,
-                    y + angle2.sin() * outline_radius_y,
-                ],
-                color: outline_color,
-            });
-            
-            // Основной круг
-            vertices.push(Vertex {
-                position: [x, y],
-                color: color,
-            });
-            vertices.push(Vertex {
-                position: [
-                    x + angle1.cos() * radius_x,
-                    y + angle1.sin() * radius_y,
-                ],
-                color: color,
-            });
-            vertices.push(Vertex {
-                position: [
-                    x + angle2.cos() * radius_x,
-                    y + angle2.sin() * radius_y,
-                ],
-                color: color,
-            });
-        }
-        
-        // Отрисовка ног
-        let leg_count = creature.genome.body_parts.legs.len();
-        if leg_count > 0 {
-            let leg_spacing = std::f32::consts::PI * 2.0 / leg_count as f32;
-            for (i, leg) in creature.genome.body_parts.legs.iter().enumerate() {
-                let leg_angle = (i as f32 * leg_spacing) - std::f32::consts::PI / 2.0;
-                let leg_start_x = x + leg_angle.cos() * radius_norm;
-                let leg_start_y = y + leg_angle.sin() * radius_norm;
+        // Отрисовка костей (без использования радиуса)
+        let bone_count = creature.genome.bones.len();
+        if bone_count > 0 {
+            for bone in &creature.genome.bones {
+                // Вычисляем позицию начала и конца кости в нормализованных координатах
+                let bone_start_x = x + bone.position.x * bone_scale;
+                let bone_start_y = y + bone.position.y * bone_scale;
+                let bone_length = bone.length * bone_scale;
+                let bone_end_x = bone_start_x + bone.angle.cos() * bone_length;
+                let bone_end_y = bone_start_y + bone.angle.sin() * bone_length;
                 
-                let mut current_x = leg_start_x;
-                let mut current_y = leg_start_y;
-                let mut current_angle = leg_angle;
+                // Рисуем кость как линию
+                let bone_width = bone.width * bone_scale;
+                let perp_angle = bone.angle + std::f32::consts::PI / 2.0;
                 
-                for segment in &leg.segments {
-                    let segment_length = segment.length * 0.02; // Масштабируем
-                    let segment_end_x = current_x + current_angle.cos() * segment_length;
-                    let segment_end_y = current_y + current_angle.sin() * segment_length;
-                    
-                    // Рисуем сегмент ноги
-                    let segment_width = segment.width * 0.01;
-                    let perp_angle = current_angle + std::f32::consts::PI / 2.0;
-                    
-                    let p1_x = current_x + perp_angle.cos() * segment_width;
-                    let p1_y = current_y + perp_angle.sin() * segment_width;
-                    let p2_x = current_x - perp_angle.cos() * segment_width;
-                    let p2_y = current_y - perp_angle.sin() * segment_width;
-                    let p3_x = segment_end_x + perp_angle.cos() * segment_width;
-                    let p3_y = segment_end_y + perp_angle.sin() * segment_width;
-                    let p4_x = segment_end_x - perp_angle.cos() * segment_width;
-                    let p4_y = segment_end_y - perp_angle.sin() * segment_width;
-                    
-                    // Два треугольника для сегмента
-                    vertices.push(Vertex { position: [p1_x, p1_y], color });
-                    vertices.push(Vertex { position: [p2_x, p2_y], color });
-                    vertices.push(Vertex { position: [p3_x, p3_y], color });
-                    vertices.push(Vertex { position: [p2_x, p2_y], color });
-                    vertices.push(Vertex { position: [p4_x, p4_y], color });
-                    vertices.push(Vertex { position: [p3_x, p3_y], color });
-                    
-                    current_x = segment_end_x;
-                    current_y = segment_end_y;
-                    // Небольшой изгиб в суставе
-                    current_angle += 0.1;
-                }
+                let p1_x = bone_start_x + perp_angle.cos() * bone_width;
+                let p1_y = bone_start_y + perp_angle.sin() * bone_width;
+                let p2_x = bone_start_x - perp_angle.cos() * bone_width;
+                let p2_y = bone_start_y - perp_angle.sin() * bone_width;
+                let p3_x = bone_end_x + perp_angle.cos() * bone_width;
+                let p3_y = bone_end_y + perp_angle.sin() * bone_width;
+                let p4_x = bone_end_x - perp_angle.cos() * bone_width;
+                let p4_y = bone_end_y - perp_angle.sin() * bone_width;
+                
+                // Два треугольника для кости
+                vertices.push(Vertex { position: [p1_x, p1_y], color });
+                vertices.push(Vertex { position: [p2_x, p2_y], color });
+                vertices.push(Vertex { position: [p3_x, p3_y], color });
+                vertices.push(Vertex { position: [p2_x, p2_y], color });
+                vertices.push(Vertex { position: [p4_x, p4_y], color });
+                vertices.push(Vertex { position: [p3_x, p3_y], color });
             }
         }
         
-        // Отрисовка рук (аналогично ногам)
-        let arm_count = creature.genome.body_parts.arms.len();
-        if arm_count > 0 {
-            let arm_spacing = std::f32::consts::PI * 2.0 / arm_count as f32;
-            for (i, arm) in creature.genome.body_parts.arms.iter().enumerate() {
-                let arm_angle = (i as f32 * arm_spacing) + std::f32::consts::PI / 2.0;
-                let arm_start_x = x + arm_angle.cos() * radius_norm;
-                let arm_start_y = y + arm_angle.sin() * radius_norm;
+        // Отрисовка суставов (круги в местах соединения костей)
+        for joint in &creature.genome.joints {
+            let joint_x = x + joint.position.x * bone_scale;
+            let joint_y = y + joint.position.y * bone_scale;
+            let joint_radius = 0.02; // Фиксированный размер сустава в нормализованных координатах
+            let joint_segments = 12; // Больше сегментов для более гладкого круга
+            
+            for i in 0..joint_segments {
+                let angle1 = (i as f32 / joint_segments as f32) * std::f32::consts::PI * 2.0;
+                let angle2 = ((i + 1) as f32 / joint_segments as f32) * std::f32::consts::PI * 2.0;
                 
-                let mut current_x = arm_start_x;
-                let mut current_y = arm_start_y;
-                let mut current_angle = arm_angle;
+                vertices.push(Vertex { position: [joint_x, joint_y], color });
+                vertices.push(Vertex { position: [joint_x + angle1.cos() * joint_radius, joint_y + angle1.sin() * joint_radius], color });
+                vertices.push(Vertex { position: [joint_x + angle2.cos() * joint_radius, joint_y + angle2.sin() * joint_radius], color });
+            }
+        }
+        
+        // Отрисовка мышц (линии между точками прикрепления)
+        for (muscle_idx, muscle) in creature.genome.muscles.iter().enumerate() {
+            if let (Some(bone1), Some(bone2)) = (
+                creature.genome.bones.get(muscle.bone1_id),
+                creature.genome.bones.get(muscle.bone2_id),
+            ) {
+                // Вычисляем позиции точек прикрепления на костях
+                let bone1_start_x = x + bone1.position.x * bone_scale;
+                let bone1_start_y = y + bone1.position.y * bone_scale;
+                let bone1_length = bone1.length * bone_scale;
+                let attach1_x = bone1_start_x + bone1.angle.cos() * bone1_length * muscle.attachment_point1;
+                let attach1_y = bone1_start_y + bone1.angle.sin() * bone1_length * muscle.attachment_point1;
                 
-                for segment in &arm.segments {
-                    let segment_length = segment.length * 0.015;
-                    let segment_end_x = current_x + current_angle.cos() * segment_length;
-                    let segment_end_y = current_y + current_angle.sin() * segment_length;
+                let bone2_start_x = x + bone2.position.x * bone_scale;
+                let bone2_start_y = y + bone2.position.y * bone_scale;
+                let bone2_length = bone2.length * bone_scale;
+                let attach2_x = bone2_start_x + bone2.angle.cos() * bone2_length * muscle.attachment_point2;
+                let attach2_y = bone2_start_y + bone2.angle.sin() * bone2_length * muscle.attachment_point2;
+                
+                // Цвет мышцы зависит от активации (используем правильный индекс)
+                let activation = if muscle_idx < creature.muscle_activations.len() {
+                    creature.muscle_activations[muscle_idx]
+                } else {
+                    0.0
+                };
+                let muscle_color = [
+                    color[0] * 0.3 + activation * 0.7, // Более яркий цвет при активации
+                    color[1] * 0.3 + activation * 0.7,
+                    color[2] * 0.3 + activation * 0.7,
+                ];
+                
+                // Рисуем мышцу как линию с шириной
+                let muscle_width = 0.01; // Фиксированная ширина мышцы в нормализованных координатах
+                let dx = attach2_x - attach1_x;
+                let dy = attach2_y - attach1_y;
+                let muscle_length = (dx * dx + dy * dy).sqrt();
+                if muscle_length > 0.0 {
+                    let perp_angle = dy.atan2(dx) + std::f32::consts::PI / 2.0;
                     
-                    let segment_width = segment.width * 0.008;
-                    let perp_angle = current_angle + std::f32::consts::PI / 2.0;
+                    let p1_x = attach1_x + perp_angle.cos() * muscle_width;
+                    let p1_y = attach1_y + perp_angle.sin() * muscle_width;
+                    let p2_x = attach1_x - perp_angle.cos() * muscle_width;
+                    let p2_y = attach1_y - perp_angle.sin() * muscle_width;
+                    let p3_x = attach2_x + perp_angle.cos() * muscle_width;
+                    let p3_y = attach2_y + perp_angle.sin() * muscle_width;
+                    let p4_x = attach2_x - perp_angle.cos() * muscle_width;
+                    let p4_y = attach2_y - perp_angle.sin() * muscle_width;
                     
-                    let p1_x = current_x + perp_angle.cos() * segment_width;
-                    let p1_y = current_y + perp_angle.sin() * segment_width;
-                    let p2_x = current_x - perp_angle.cos() * segment_width;
-                    let p2_y = current_y - perp_angle.sin() * segment_width;
-                    let p3_x = segment_end_x + perp_angle.cos() * segment_width;
-                    let p3_y = segment_end_y + perp_angle.sin() * segment_width;
-                    let p4_x = segment_end_x - perp_angle.cos() * segment_width;
-                    let p4_y = segment_end_y - perp_angle.sin() * segment_width;
-                    
-                    vertices.push(Vertex { position: [p1_x, p1_y], color });
-                    vertices.push(Vertex { position: [p2_x, p2_y], color });
-                    vertices.push(Vertex { position: [p3_x, p3_y], color });
-                    vertices.push(Vertex { position: [p2_x, p2_y], color });
-                    vertices.push(Vertex { position: [p4_x, p4_y], color });
-                    vertices.push(Vertex { position: [p3_x, p3_y], color });
-                    
-                    current_x = segment_end_x;
-                    current_y = segment_end_y;
-                    current_angle += 0.1;
+                    // Два треугольника для мышцы
+                    vertices.push(Vertex { position: [p1_x, p1_y], color: muscle_color });
+                    vertices.push(Vertex { position: [p2_x, p2_y], color: muscle_color });
+                    vertices.push(Vertex { position: [p3_x, p3_y], color: muscle_color });
+                    vertices.push(Vertex { position: [p2_x, p2_y], color: muscle_color });
+                    vertices.push(Vertex { position: [p4_x, p4_y], color: muscle_color });
+                    vertices.push(Vertex { position: [p3_x, p3_y], color: muscle_color });
                 }
             }
         }

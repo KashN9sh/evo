@@ -7,11 +7,20 @@ pub struct Biomechanics {
 
 #[derive(Clone)]
 pub struct Joint {
-    pub angle: f32,
-    pub min_angle: f32,
-    pub max_angle: f32,
-    pub stiffness: f32,
-    pub damping: f32,
+    pub id: usize,
+    pub bone1_id: usize, // Первая кость
+    pub bone2_id: usize, // Вторая кость
+    pub angle: f32, // Текущий угол между костями
+    pub ligament: Ligament, // Связка, ограничивающая движение
+    pub position: cgmath::Point2<f32>, // Позиция сустава (точка соединения костей)
+}
+
+#[derive(Clone)]
+pub struct Ligament {
+    pub stiffness: f32, // Жесткость связки
+    pub damping: f32, // Демпфирование
+    pub min_angle: f32, // Минимальный угол сустава
+    pub max_angle: f32, // Максимальный угол сустава
 }
 
 #[derive(Clone)]
@@ -43,15 +52,60 @@ impl Biomechanics {
     }
 
     pub fn calculate_mass(&self, creature: &Creature) -> f32 {
-        let torso_mass = creature.genome.body_parts.torso.size * 10.0;
-        let legs_mass: f32 = creature.genome.body_parts.legs.iter()
-            .map(|leg| leg.segments.iter().map(|s| s.length * s.width * 5.0).sum::<f32>())
-            .sum();
-        let arms_mass: f32 = creature.genome.body_parts.arms.iter()
-            .map(|arm| arm.segments.iter().map(|s| s.length * s.width * 5.0).sum::<f32>())
-            .sum();
+        // Масса вычисляется как сумма масс всех костей
+        creature.genome.bones.iter().map(|b| b.mass).sum()
+    }
+    
+    /// Рассчитывает движение на основе активации мышц и углов суставов
+    /// Возвращает вектор силы, который будет применен к существу
+    pub fn calculate_movement_from_muscles(
+        &self,
+        creature: &Creature,
+        muscle_activations: &[f32],
+        dt: f32,
+    ) -> cgmath::Vector2<f32> {
+        let mut total_force = cgmath::Vector2::new(0.0, 0.0);
         
-        torso_mass + legs_mass + arms_mass
+        // Рассчитываем силу от каждой мышцы
+        for (i, activation) in muscle_activations.iter().enumerate() {
+            if i < creature.genome.muscles.len() {
+                let muscle = &creature.genome.muscles[i];
+                let force_magnitude = self.calculate_muscle_force(muscle, *activation);
+                
+                // Находим кости, к которым прикреплена мышца
+                if let (Some(bone1), Some(bone2)) = (
+                    creature.genome.bones.get(muscle.bone1_id),
+                    creature.genome.bones.get(muscle.bone2_id),
+                ) {
+                    // Находим состояние сустава
+                    if let Some(joint_state) = creature.joint_states.iter().find(|js| js.joint_id == muscle.joint_id) {
+                        // Вычисляем направление силы на основе угла между костями
+                        let bone1_angle = bone1.angle;
+                        let bone2_angle = bone2.angle + joint_state.angle;
+                        
+                        // Средний угол для направления силы
+                        let force_angle = (bone1_angle + bone2_angle) / 2.0;
+                        
+                        total_force.x += force_angle.cos() * force_magnitude;
+                        total_force.y += force_angle.sin() * force_magnitude;
+                    }
+                }
+            }
+        }
+        
+        // Применяем механическое преимущество рычагов
+        let mechanical_advantage = self.calculate_lever_mechanical_advantage(creature);
+        total_force *= mechanical_advantage;
+        
+        // Ограничиваем максимальную силу
+        let max_force = 10.0;
+        let force_magnitude = (total_force.x * total_force.x + total_force.y * total_force.y).sqrt();
+        if force_magnitude > max_force {
+            total_force.x = (total_force.x / force_magnitude) * max_force;
+            total_force.y = (total_force.y / force_magnitude) * max_force;
+        }
+        
+        total_force
     }
 
     pub fn apply_friction(&self, velocity: &mut cgmath::Vector2<f32>, dt: f32) {
@@ -64,71 +118,25 @@ impl Biomechanics {
         }
     }
     
-    // Детальная биомеханика: суставы и рычаги
-    pub fn calculate_joint_constraints(&self, creature: &Creature) -> Vec<Joint> {
-        let mut joints = Vec::new();
-        
-        // Создаем суставы для ног
-        for leg in &creature.genome.body_parts.legs {
-            for (i, _segment) in leg.segments.iter().enumerate() {
-                if i > 0 {
-                    // Сустав между сегментами
-                    let min_angle = -std::f32::consts::PI / 3.0; // -60 градусов
-                    let max_angle = std::f32::consts::PI / 3.0;  // +60 градусов
-                    joints.push(Joint {
-                        angle: 0.0,
-                        min_angle,
-                        max_angle,
-                        stiffness: 10.0,
-                        damping: 0.5,
-                    });
-                }
-            }
-        }
-        
-        // Создаем суставы для рук
-        for arm in &creature.genome.body_parts.arms {
-            for (i, _segment) in arm.segments.iter().enumerate() {
-                if i > 0 {
-                    let min_angle = -std::f32::consts::PI / 2.0; // -90 градусов
-                    let max_angle = std::f32::consts::PI / 2.0;  // +90 градусов
-                    joints.push(Joint {
-                        angle: 0.0,
-                        min_angle,
-                        max_angle,
-                        stiffness: 8.0,
-                        damping: 0.4,
-                    });
-                }
-            }
-        }
-        
-        joints
-    }
-    
     pub fn calculate_lever_mechanical_advantage(&self, creature: &Creature) -> f32 {
+        // Рассчитываем механическое преимущество на основе структуры костей и суставов
         let mut total_advantage = 1.0;
         let mut lever_count = 0;
         
-        // Рассчитываем механическое преимущество для ног
-        for leg in &creature.genome.body_parts.legs {
-            if leg.segments.len() >= 2 {
-                let total_length: f32 = leg.segments.iter().map(|s| s.length).sum();
-                let fulcrum_pos = 0.3; // Сустав примерно на 30% от начала
-                let mechanical_advantage = fulcrum_pos / (1.0 - fulcrum_pos);
-                total_advantage *= mechanical_advantage;
-                lever_count += 1;
-            }
-        }
-        
-        // Рассчитываем для рук
-        for arm in &creature.genome.body_parts.arms {
-            if arm.segments.len() >= 2 {
-                let total_length: f32 = arm.segments.iter().map(|s| s.length).sum();
-                let fulcrum_pos = 0.25; // Сустав на 25% от начала
-                let mechanical_advantage = fulcrum_pos / (1.0 - fulcrum_pos);
-                total_advantage *= mechanical_advantage;
-                lever_count += 1;
+        // Для каждого сустава вычисляем механическое преимущество
+        for joint in &creature.genome.joints {
+            if let (Some(bone1), Some(bone2)) = (
+                creature.genome.bones.get(joint.bone1_id),
+                creature.genome.bones.get(joint.bone2_id),
+            ) {
+                let total_length = bone1.length + bone2.length;
+                if total_length > 0.0 {
+                    // Фулькрум примерно на 30% от начала
+                    let fulcrum_pos = 0.3;
+                    let mechanical_advantage = fulcrum_pos / (1.0 - fulcrum_pos);
+                    total_advantage *= mechanical_advantage;
+                    lever_count += 1;
+                }
             }
         }
         
@@ -139,22 +147,8 @@ impl Biomechanics {
         }
     }
     
-    pub fn apply_joint_constraints(&self, joints: &mut [Joint], target_angles: &[f32], dt: f32) {
-        for (joint, &target_angle) in joints.iter_mut().zip(target_angles.iter()) {
-            // Ограничиваем целевой угол пределами сустава
-            let clamped_target = target_angle.max(joint.min_angle).min(joint.max_angle);
-            
-            // Пружинная модель для движения сустава
-            let angle_error = clamped_target - joint.angle;
-            let torque = angle_error * joint.stiffness;
-            let angular_velocity = torque - joint.angle * joint.damping;
-            
-            joint.angle += angular_velocity * dt;
-            
-            // Ограничиваем угол пределами
-            joint.angle = joint.angle.max(joint.min_angle).min(joint.max_angle);
-        }
-    }
+    // Эта функция больше не используется, так как суставы теперь в геноме
+    // Удалена для упрощения
     
     pub fn calculate_effective_force(&self, creature: &Creature, muscle_force: f32) -> f32 {
         let mechanical_advantage = self.calculate_lever_mechanical_advantage(creature);
