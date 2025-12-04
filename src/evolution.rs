@@ -350,7 +350,7 @@ impl EvolutionSystem {
         for bone in &mut genome.bones {
             if rng.gen::<f32>() < 0.6 {
                 bone.length += rng.gen::<f32>() * 0.2 - 0.1;
-                bone.length = bone.length.max(0.1).min(2.0);
+                bone.length = bone.length.max(0.5).min(2.0); // Увеличили минимальную длину при мутации с 0.1 до 0.5
             }
             if rng.gen::<f32>() < 0.5 {
                 bone.width += rng.gen::<f32>() * 0.05 - 0.025;
@@ -401,7 +401,7 @@ impl EvolutionSystem {
             let new_bone_id = genome.bones.len();
             let new_bone = Bone {
                 id: new_bone_id,
-                length: 0.3 + rng.gen::<f32>() * 0.4,
+                length: 0.6 + rng.gen::<f32>() * 0.4, // Увеличили минимальную длину с 0.3 до 0.6
                 width: 0.05 + rng.gen::<f32>() * 0.1,
                 mass: 1.0 + rng.gen::<f32>() * 2.0,
                 position: cgmath::Point3::new(
@@ -415,23 +415,76 @@ impl EvolutionSystem {
             
             genome.bones.push(new_bone);
             
-            // ВСЕГДА создаем сустав между новой костью и родительской (если есть родитель)
+            // Ищем сустав с только одной костью (bone1_id == bone2_id), чтобы начать с него новую кость
+            let mut found_single_bone_joint = false;
             if let Some(parent_id) = parent_id {
-                let joint = Joint {
-                    id: genome.joints.len(),
-                    bone1_id: parent_id,
-                    bone2_id: new_bone_id,
-                    angle: 0.0,
-                    ligament: Ligament {
-                        stiffness: 8.0 + rng.gen::<f32>() * 4.0,
-                        damping: 0.3 + rng.gen::<f32>() * 0.3,
-                        min_angle: -std::f32::consts::PI / 3.0,
-                        max_angle: std::f32::consts::PI / 3.0,
-                    },
-                    position: genome.bones[parent_id].position,
-                };
-                genome.joints.push(joint);
+                // Ищем концевой сустав родительской кости (bone1_id == bone2_id == parent_id)
+                for joint in &mut genome.joints {
+                    if joint.bone1_id == parent_id && joint.bone2_id == parent_id {
+                        // Нашли концевой сустав родительской кости - используем его как начало новой кости
+                        joint.bone2_id = new_bone_id;
+                        found_single_bone_joint = true;
+                        break;
+                    }
+                }
             }
+            
+            // Если не нашли сустав с одной костью, создаем новый сустав
+            if !found_single_bone_joint {
+                if let Some(parent_id) = parent_id {
+                    // Создаем сустав между родительской и новой костью
+                    let joint = Joint {
+                        id: genome.joints.len(),
+                        bone1_id: parent_id,
+                        bone2_id: new_bone_id,
+                        angle: 0.0,
+                        ligament: Ligament {
+                            stiffness: 8.0 + rng.gen::<f32>() * 4.0,
+                            damping: 0.3 + rng.gen::<f32>() * 0.3,
+                            min_angle: -std::f32::consts::PI / 3.0,
+                            max_angle: std::f32::consts::PI / 3.0,
+                        },
+                        position: genome.bones[parent_id].position,
+                    };
+                    genome.joints.push(joint);
+                } else {
+                    // Если нет родителя, создаем корневой сустав (bone1_id == bone2_id == new_bone_id)
+                    let joint = Joint {
+                        id: genome.joints.len(),
+                        bone1_id: new_bone_id,
+                        bone2_id: new_bone_id,
+                        angle: 0.0,
+                        ligament: Ligament {
+                            stiffness: 8.0 + rng.gen::<f32>() * 4.0,
+                            damping: 0.3 + rng.gen::<f32>() * 0.3,
+                            min_angle: -std::f32::consts::PI / 3.0,
+                            max_angle: std::f32::consts::PI / 3.0,
+                        },
+                        position: genome.bones[new_bone_id].position,
+                    };
+                    genome.joints.push(joint);
+                }
+            }
+            
+            // Создаем концевой сустав для новой кости (bone1_id == bone2_id == new_bone_id)
+            let end_joint = Joint {
+                id: genome.joints.len(),
+                bone1_id: new_bone_id,
+                bone2_id: new_bone_id,
+                angle: 0.0,
+                ligament: Ligament {
+                    stiffness: 8.0 + rng.gen::<f32>() * 4.0,
+                    damping: 0.3 + rng.gen::<f32>() * 0.3,
+                    min_angle: -std::f32::consts::PI / 3.0,
+                    max_angle: std::f32::consts::PI / 3.0,
+                },
+                position: cgmath::Point3::new(
+                    genome.bones[new_bone_id].position.x + genome.bones[new_bone_id].angle.cos() * genome.bones[new_bone_id].length,
+                    genome.bones[new_bone_id].position.y + genome.bones[new_bone_id].angle.sin() * genome.bones[new_bone_id].length,
+                    genome.bones[new_bone_id].position.z,
+                ),
+            };
+            genome.joints.push(end_joint);
         }
         
         // Также можем добавить новый сустав между существующими костями (если его еще нет)
@@ -489,21 +542,36 @@ impl EvolutionSystem {
         if rng.gen::<f32>() < muscle_add_chance {
             if rng.gen::<f32>() < 0.9 && genome.muscles.len() < 20 {
                 // Пытаемся добавить мышцу через существующий сустав
+                // Мышца прикрепляется к концевым суставам костей
                 if genome.joints.len() > 0 {
                     let joint_idx = rng.gen_range(0..genome.joints.len());
                     let joint = &genome.joints[joint_idx];
                     
-                    genome.muscles.push(Muscle {
-                        strength: 0.5 + rng.gen::<f32>() * 1.0,
-                        speed: 0.5 + rng.gen::<f32>() * 1.0,
-                        efficiency: 0.2 + rng.gen::<f32>() * 0.3,
-                        endurance: 0.5 + rng.gen::<f32>() * 1.0,
-                        bone1_id: joint.bone1_id,
-                        bone2_id: joint.bone2_id,
-                        joint_id: joint.id,
-                        attachment_point1: rng.gen::<f32>(),
-                        attachment_point2: rng.gen::<f32>(),
-                    });
+                    // Находим концевые суставы для обеих костей
+                    // Концевой сустав кости - это сустав, где bone1_id == bone.id && bone2_id == bone.id
+                    // или сустав, где кость является второй (bone2_id == bone.id) и это не сустав между костями
+                    let end_joint1 = genome.joints.iter().find(|j| 
+                        (j.bone1_id == joint.bone1_id && j.bone2_id == joint.bone1_id) ||
+                        (j.bone2_id == joint.bone1_id && j.bone1_id != joint.bone2_id && j.id != joint.id)
+                    );
+                    let end_joint2 = genome.joints.iter().find(|j| 
+                        (j.bone1_id == joint.bone2_id && j.bone2_id == joint.bone2_id) ||
+                        (j.bone2_id == joint.bone2_id && j.bone1_id != joint.bone1_id && j.id != joint.id)
+                    );
+                    
+                    if let (Some(end_j1), Some(end_j2)) = (end_joint1, end_joint2) {
+                        genome.muscles.push(Muscle {
+                            strength: 0.5 + rng.gen::<f32>() * 1.0,
+                            speed: 0.5 + rng.gen::<f32>() * 1.0,
+                            efficiency: 0.2 + rng.gen::<f32>() * 0.3,
+                            endurance: 0.5 + rng.gen::<f32>() * 1.0,
+                            bone1_id: joint.bone1_id,
+                            bone2_id: joint.bone2_id,
+                            joint_id: joint.id, // Сустав между костями, где изменяется угол
+                            end_joint1_id: end_j1.id, // Концевой сустав первой кости
+                            end_joint2_id: end_j2.id, // Концевой сустав второй кости
+                        });
+                    }
                 } else if genome.bones.len() >= 2 {
                     // Если нет суставов, но есть кости - создаем новый сустав и мышцу
                     let bone1_id = rng.gen_range(0..genome.bones.len());
@@ -527,18 +595,30 @@ impl EvolutionSystem {
                         };
                         genome.joints.push(joint);
                         
-                        // Создаем мышцу через новый сустав
-                        genome.muscles.push(Muscle {
-                            strength: 0.5 + rng.gen::<f32>() * 1.0,
-                            speed: 0.5 + rng.gen::<f32>() * 1.0,
-                            efficiency: 0.2 + rng.gen::<f32>() * 0.3,
-                            endurance: 0.5 + rng.gen::<f32>() * 1.0,
-                            bone1_id,
-                            bone2_id,
-                            joint_id: new_joint_id,
-                            attachment_point1: rng.gen::<f32>(),
-                            attachment_point2: rng.gen::<f32>(),
-                        });
+                        // Находим концевые суставы для обеих костей
+                        let end_joint1 = genome.joints.iter().find(|j| 
+                            (j.bone1_id == bone1_id && j.bone2_id == bone1_id) ||
+                            (j.bone2_id == bone1_id && j.bone1_id != bone2_id && j.id != new_joint_id)
+                        );
+                        let end_joint2 = genome.joints.iter().find(|j| 
+                            (j.bone1_id == bone2_id && j.bone2_id == bone2_id) ||
+                            (j.bone2_id == bone2_id && j.bone1_id != bone1_id && j.id != new_joint_id)
+                        );
+                        
+                        if let (Some(end_j1), Some(end_j2)) = (end_joint1, end_joint2) {
+                            // Создаем мышцу через новый сустав
+                            genome.muscles.push(Muscle {
+                                strength: 0.5 + rng.gen::<f32>() * 1.0,
+                                speed: 0.5 + rng.gen::<f32>() * 1.0,
+                                efficiency: 0.2 + rng.gen::<f32>() * 0.3,
+                                endurance: 0.5 + rng.gen::<f32>() * 1.0,
+                                bone1_id,
+                                bone2_id,
+                                joint_id: new_joint_id,
+                                end_joint1_id: end_j1.id,
+                                end_joint2_id: end_j2.id,
+                            });
+                        }
                     }
                 }
             } else if genome.muscles.len() > 1 {
@@ -567,12 +647,10 @@ impl EvolutionSystem {
             
             // Мутация точек прикрепления
             if rng.gen::<f32>() < 0.3 {
-                muscle.attachment_point1 += rng.gen::<f32>() * 0.2 - 0.1;
-                muscle.attachment_point1 = muscle.attachment_point1.clamp(0.0, 1.0);
+                // Мутация мышц больше не изменяет точки прикрепления, так как они всегда на концах костей
             }
             if rng.gen::<f32>() < 0.3 {
-                muscle.attachment_point2 += rng.gen::<f32>() * 0.2 - 0.1;
-                muscle.attachment_point2 = muscle.attachment_point2.clamp(0.0, 1.0);
+                // Мутация мышц больше не изменяет точки прикрепления, так как они всегда на концах костей
             }
         }
     }
@@ -747,6 +825,7 @@ impl EvolutionSystem {
             match (m1, m2) {
                 (Some(m1), Some(m2)) => {
                     // Среднее между двумя мышцами
+                    // При скрещивании выбираем случайно концевой сустав от одного из родителей
                     result.push(Muscle {
                         strength: (m1.strength + m2.strength) / 2.0,
                         speed: (m1.speed + m2.speed) / 2.0,
@@ -755,8 +834,8 @@ impl EvolutionSystem {
                         bone1_id: m1.bone1_id,
                         bone2_id: m1.bone2_id,
                         joint_id: m1.joint_id,
-                        attachment_point1: (m1.attachment_point1 + m2.attachment_point1) / 2.0,
-                        attachment_point2: (m1.attachment_point2 + m2.attachment_point2) / 2.0,
+                        end_joint1_id: if rng.gen::<f32>() < 0.5 { m1.end_joint1_id } else { m2.end_joint1_id },
+                        end_joint2_id: if rng.gen::<f32>() < 0.5 { m1.end_joint2_id } else { m2.end_joint2_id },
                     });
                 }
                 (Some(m), None) | (None, Some(m)) => {

@@ -56,12 +56,12 @@ pub struct Muscle {
     pub speed: f32,
     pub efficiency: f32,
     pub endurance: f32,
-    // Мышца прикреплена к двум костям через суставы
+    // Мышца прикреплена к концевым суставам двух костей
     pub bone1_id: usize, // ID первой кости
     pub bone2_id: usize, // ID второй кости
-    pub joint_id: usize, // ID сустава между костями
-    pub attachment_point1: f32, // Точка прикрепления на первой кости (0.0-1.0)
-    pub attachment_point2: f32, // Точка прикрепления на второй кости (0.0-1.0)
+    pub joint_id: usize, // ID сустава между костями (где мышца изменяет угол)
+    pub end_joint1_id: usize, // ID концевого сустава первой кости (где прикреплена мышца)
+    pub end_joint2_id: usize, // ID концевого сустава второй кости (где прикреплена мышца)
 }
 
 #[derive(Clone)]
@@ -193,51 +193,106 @@ impl Default for Genome {
             enabled: true,
         });
         
-        // Создаем базовую структуру из костей, суставов и мышц
-        // Начинаем с простого существа: туловище + одна нога
+        // Создаем начальную структуру: две кости, соединенные суставом, с мышцей
+        // Структура: сустав - кость - сустав - кость - сустав
+        // Мышца прикреплена к концевым суставам костей
         
-        // Кость 0: туловище (корневая кость)
-        let torso = Bone {
+        let mut bones = Vec::new();
+        let mut joints = Vec::new();
+        let mut muscles = Vec::new();
+        
+        // Кость 0: первая кость (корневая)
+        let bone0_length: f32 = 1.0;
+        let bone0_angle: f32 = 0.0; // Горизонтально
+        let bone0_pos = Point3::new(0.0, 0.0, 0.0);
+        
+        // Вычисляем конец кости 0
+        let bone0_end_x = bone0_pos.x + bone0_angle.cos() * bone0_length;
+        let bone0_end_y = bone0_pos.y + bone0_angle.sin() * bone0_length;
+        let bone0_end_z = bone0_pos.z;
+        
+        // Кость 1: вторая кость
+        let bone1_length: f32 = 1.0;
+        let bone1_angle: f32 = std::f32::consts::PI / 2.0; // Вертикально вниз
+        
+        // Вычисляем конец кости 1
+        let bone1_end_x = bone0_end_x + bone1_angle.cos() * bone1_length;
+        let bone1_end_y = bone0_end_y + bone1_angle.sin() * bone1_length;
+        let bone1_end_z = bone0_end_z;
+        
+        // Создаем кости
+        let bone0 = Bone {
             id: 0,
-            length: 1.0,
-            width: 0.3,
-            mass: 10.0,
-            position: Point3::new(0.0, 0.0, 0.0),
-            angle: 0.0,
+            length: bone0_length,
+            width: 0.2,
+            mass: 5.0,
+            position: bone0_pos,
+            angle: bone0_angle,
             parent_bone_id: None,
         };
+        bones.push(bone0);
         
-        // Кость 1: нога
-        let leg = Bone {
+        let bone1 = Bone {
             id: 1,
-            length: 0.5,
-            width: 0.1,
-            mass: 2.0,
-            position: Point3::new(0.0, -0.5, 0.0), // Под туловищем
-            angle: std::f32::consts::PI / 2.0, // Вертикально вниз
+            length: bone1_length,
+            width: 0.2,
+            mass: 5.0,
+            position: Point3::new(0.0, 0.0, 0.0), // Позиция определяется суставом
+            angle: bone1_angle,
             parent_bone_id: Some(0),
         };
+        bones.push(bone1);
         
-        let bones = vec![torso, leg];
-        
-        // Сустав между туловищем и ногой
-        let joint = crate::biomechanics::Joint {
+        // Сустав 0: начало кости 0 (корневой сустав)
+        let joint0 = crate::biomechanics::Joint {
             id: 0,
             bone1_id: 0,
-            bone2_id: 1,
+            bone2_id: 0, // Кость соединена сама с собой в начале
             angle: 0.0,
             ligament: crate::biomechanics::Ligament {
                 stiffness: 10.0,
                 damping: 0.5,
-                min_angle: -std::f32::consts::PI / 3.0, // -60 градусов
-                max_angle: std::f32::consts::PI / 3.0,  // +60 градусов
+                min_angle: -std::f32::consts::PI / 3.0,
+                max_angle: std::f32::consts::PI / 3.0,
             },
-            position: Point3::new(0.0, -0.5, 0.0),
+            position: Point3::new(0.0, 0.0, 0.0), // Начало кости 0
         };
+        joints.push(joint0);
         
-        let joints = vec![joint];
+        // Сустав 1: конец кости 0 и начало кости 1 (соединяет кости)
+        let joint1 = crate::biomechanics::Joint {
+            id: 1,
+            bone1_id: 0,
+            bone2_id: 1, // Соединяет кость 0 и кость 1
+            angle: 0.0,
+            ligament: crate::biomechanics::Ligament {
+                stiffness: 10.0,
+                damping: 0.5,
+                min_angle: -std::f32::consts::PI / 3.0,
+                max_angle: std::f32::consts::PI / 3.0,
+            },
+            position: Point3::new(bone0_end_x, bone0_end_y, bone0_end_z), // Конец кости 0, начало кости 1
+        };
+        joints.push(joint1);
         
-        // Мышца, соединяющая туловище и ногу
+        // Сустав 2: конец кости 1
+        let joint2 = crate::biomechanics::Joint {
+            id: 2,
+            bone1_id: 1,
+            bone2_id: 1, // Кость соединена сама с собой в конце
+            angle: 0.0,
+            ligament: crate::biomechanics::Ligament {
+                stiffness: 10.0,
+                damping: 0.5,
+                min_angle: -std::f32::consts::PI / 3.0,
+                max_angle: std::f32::consts::PI / 3.0,
+            },
+            position: Point3::new(bone1_end_x, bone1_end_y, bone1_end_z), // Конец кости 1
+        };
+        joints.push(joint2);
+        
+        // Мышца прикреплена к концевым суставам костей (сустав 0 и сустав 2)
+        // Мышца изменяет угол в суставе 1 (между костями)
         let muscle = Muscle {
             strength: 1.0,
             speed: 1.0,
@@ -245,12 +300,11 @@ impl Default for Genome {
             endurance: 1.0,
             bone1_id: 0,
             bone2_id: 1,
-            joint_id: 0,
-            attachment_point1: 0.5, // Середина туловища
-            attachment_point2: 0.0, // Начало ноги
+            joint_id: 1, // Сустав между костями, где изменяется угол
+            end_joint1_id: 0, // Концевой сустав кости 0 (начало)
+            end_joint2_id: 2, // Концевой сустав кости 1 (конец)
         };
-        
-        let muscles = vec![muscle];
+        muscles.push(muscle);
         
         Self {
             bones,

@@ -57,7 +57,7 @@ impl Biomechanics {
     }
     
     /// Рассчитывает момент вращения от мышц вокруг суставов
-    /// Мышцы тянут кости, создавая вращающий момент вокруг сустава
+    /// Мышцы прикреплены к концевым суставам костей и изменяют угол между костями
     pub fn calculate_joint_torques_from_muscles(
         &self,
         creature: &Creature,
@@ -72,29 +72,43 @@ impl Biomechanics {
                 let muscle = &creature.genome.muscles[i];
                 let force_magnitude = self.calculate_muscle_force(muscle, *activation);
                 
-                // Находим кости, к которым прикреплена мышца
+                // Находим кости и суставы
                 if let (Some(bone1), Some(bone2)) = (
                     creature.genome.bones.get(muscle.bone1_id),
                     creature.genome.bones.get(muscle.bone2_id),
                 ) {
-                    // Находим состояние сустава
-                    if let Some(joint_state) = creature.joint_states.iter().find(|js| js.joint_id == muscle.joint_id) {
-                        // Вычисляем плечо рычага - расстояние от точки прикрепления мышцы до сустава
-                        // attachment_point - это доля длины кости от начала (0.0 = начало, 1.0 = конец)
-                        let lever_arm1 = bone1.length * muscle.attachment_point1;
-                        let lever_arm2 = bone2.length * muscle.attachment_point2;
-                        
-                        // Момент вращения = сила * плечо рычага
-                        // Мышца тянет кости друг к другу, создавая момент вращения вокруг сустава
-                        // Направление момента зависит от того, какая кость вращается
-                        let torque = force_magnitude * (lever_arm1 + lever_arm2) * 0.5;
-                        
-                        // Момент направлен на сгибание сустава (уменьшение угла)
-                        // Если активация > 0.5, мышца сгибает сустав, иначе разгибает
-                        let direction = if *activation > 0.5 { -1.0 } else { 1.0 };
-                        let final_torque = torque * direction;
-                        
-                        *joint_torques.entry(muscle.joint_id).or_insert(0.0) += final_torque;
+                    // Находим концевой сустав первой кости
+                    if let Some(end_joint1) = creature.genome.joints.iter().find(|j| j.id == muscle.end_joint1_id) {
+                        // Находим концевой сустав второй кости
+                        if let Some(end_joint2) = creature.genome.joints.iter().find(|j| j.id == muscle.end_joint2_id) {
+                            // Находим сустав между костями (где изменяется угол)
+                            if let Some(joint) = creature.genome.joints.iter().find(|j| j.id == muscle.joint_id) {
+                                // Вычисляем плечо рычага - расстояние от концевого сустава до сустава между костями
+                                // Плечо = длина кости (от сустава между костями до концевого сустава)
+                                let lever_arm1 = bone1.length;
+                                let lever_arm2 = bone2.length;
+                                
+                                // Момент вращения = сила * плечо рычага
+                                // Мышца тянет концы костей, создавая момент вращения вокруг сустава между костями
+                                // Момент пропорционален силе мышцы и длине костей
+                                // Увеличиваем коэффициент для более сильного эффекта
+                                let torque = force_magnitude * (lever_arm1 + lever_arm2) * 0.5 * 10.0; // Увеличили в 10 раз
+                                
+                                // Направление момента: мышца сжимается (активация > 0.5) - уменьшает угол, разжимается - увеличивает
+                                // Но для движения нужно, чтобы угол изменялся циклически
+                                // Используем синусоидальную зависимость от активации для создания колебаний
+                                let direction = (*activation * 2.0 - 1.0); // Преобразуем 0-1 в -1..1
+                                let final_torque = torque * direction;
+                                
+                                *joint_torques.entry(muscle.joint_id).or_insert(0.0) += final_torque;
+                                
+                                // Отладочная информация
+                                if creature.id == 0 && muscle.joint_id < 3 {
+                                    eprintln!("DEBUG TORQUE: Мышца {}: активация={:.4}, сила={:.4}, момент={:.4}", 
+                                        i, activation, force_magnitude, final_torque);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -104,51 +118,180 @@ impl Biomechanics {
     }
     
     /// Рассчитывает движение на основе активации мышц и углов суставов
+    /// Движение происходит за счет того, что кости отталкиваются от земли
     /// Возвращает вектор силы, который будет применен к существу
-    /// Движение возникает из-за того, что кости толкают/тянут тело при вращении вокруг суставов
     pub fn calculate_movement_from_muscles(
         &self,
         creature: &Creature,
+        creature_position: &cgmath::Point3<f32>,
         muscle_activations: &[f32],
+        previous_joint_states: &[crate::creature::JointState],
+        dt: f32,
+    ) -> cgmath::Vector3<f32> {
+        // Используем текущие состояния суставов из существа
+        self.calculate_movement_from_muscles_with_states(
+            creature,
+            creature_position,
+            muscle_activations,
+            previous_joint_states,
+            &creature.joint_states,
+            dt,
+        )
+    }
+    
+    /// Рассчитывает движение с явно указанными текущими состояниями суставов
+    pub fn calculate_movement_from_muscles_with_states(
+        &self,
+        creature: &Creature,
+        creature_position: &cgmath::Point3<f32>,
+        muscle_activations: &[f32],
+        previous_joint_states: &[crate::creature::JointState],
+        current_joint_states: &[crate::creature::JointState],
         dt: f32,
     ) -> cgmath::Vector3<f32> {
         let mut total_force = cgmath::Vector3::new(0.0, 0.0, 0.0);
         
-        // Рассчитываем силу от каждой мышцы через вращение костей вокруг суставов
-        for (i, activation) in muscle_activations.iter().enumerate() {
-            if i < creature.genome.muscles.len() {
-                let muscle = &creature.genome.muscles[i];
-                let force_magnitude = self.calculate_muscle_force(muscle, *activation);
-                
-                // Находим кости, к которым прикреплена мышца
-                if let (Some(bone1), Some(bone2)) = (
-                    creature.genome.bones.get(muscle.bone1_id),
-                    creature.genome.bones.get(muscle.bone2_id),
+        // Вычисляем реальные позиции концов всех костей в мировых координатах
+        // и проверяем, какие кости касаются земли (Z = 0 или близко к 0)
+        let ground_level = 0.0;
+        let ground_tolerance = 0.5; // Увеличиваем толерантность для контакта с землей
+        
+        // Отладочная информация (только для первого существа)
+        let mut debug_bone_count = 0;
+        
+        // Для каждой кости вычисляем позицию ее конца в мировых координатах
+        for bone in &creature.genome.bones {
+            // Находим сустав, где начинается кость
+            let start_joint = creature.genome.joints.iter().find(|j| j.bone1_id == bone.id);
+            // Позиция начала кости в мировых координатах = позиция существа + локальная позиция сустава
+            let start_pos_local = if let Some(joint) = start_joint {
+                joint.position
+            } else {
+                bone.position
+            };
+            let start_pos = cgmath::Point3::new(
+                creature_position.x + start_pos_local.x,
+                creature_position.y + start_pos_local.y,
+                creature_position.z + start_pos_local.z,
+            );
+            
+            // Вычисляем угол кости с учетом состояния суставов
+            let mut bone_angle = bone.angle;
+            // Если у кости есть родитель, учитываем угол сустава
+            if let Some(parent_id) = bone.parent_bone_id {
+                if let Some(joint) = creature.genome.joints.iter().find(|j| 
+                    (j.bone1_id == parent_id && j.bone2_id == bone.id) ||
+                    (j.bone2_id == parent_id && j.bone1_id == bone.id)
                 ) {
-                    // Находим состояние сустава
-                    if let Some(joint_state) = creature.joint_states.iter().find(|js| js.joint_id == muscle.joint_id) {
-                        // Вычисляем позицию конца кости (которая толкает тело)
-                        // Кость вращается вокруг сустава, и ее конец создает силу
-                        let bone1_angle = bone1.angle;
-                        let bone2_angle = bone2.angle + joint_state.angle;
-                        
-                        // Конец второй кости (дальше от сустава) толкает тело
-                        let bone_end_x = joint_state.angle.cos() * bone2.length;
-                        let bone_end_y = joint_state.angle.sin() * bone2.length;
-                        
-                        // Сила направлена от конца кости (кость толкает тело при движении)
-                        // Угловая скорость сустава влияет на силу
-                        let angular_velocity = joint_state.angle; // Упрощенно используем угол как скорость
-                        let force_scale = angular_velocity.abs() * force_magnitude;
-                        
-                        // Направление силы зависит от направления вращения
-                        let force_angle = bone2_angle + if angular_velocity > 0.0 { std::f32::consts::PI / 2.0 } else { -std::f32::consts::PI / 2.0 };
-                        
-                        total_force.x += force_angle.cos() * force_scale;
-                        total_force.y += force_angle.sin() * force_scale;
-                        total_force.z = 0.0; // Движение в плоскости XY
+                    if let Some(joint_state) = current_joint_states.iter().find(|js| js.joint_id == joint.id) {
+                        bone_angle += joint_state.angle;
                     }
                 }
+            }
+            
+            // Позиция конца кости
+            let bone_end_x = start_pos.x + bone_angle.cos() * bone.length;
+            let bone_end_y = start_pos.y + bone_angle.sin() * bone.length;
+            let bone_end_z = start_pos.z;
+            
+            // Проверяем, касается ли конец кости земли
+            if bone_end_z <= ground_level + ground_tolerance {
+                // Вычисляем угловую скорость сустава (изменение угла во времени)
+                // Ищем сустав, который соединяет эту кость с родительской костью
+                let angular_velocity = if let Some(parent_id) = bone.parent_bone_id {
+                    // Ищем сустав между родительской костью и этой костью
+                    if let Some(joint) = creature.genome.joints.iter().find(|j| 
+                        (j.bone1_id == parent_id && j.bone2_id == bone.id) ||
+                        (j.bone2_id == parent_id && j.bone1_id == bone.id)
+                    ) {
+                        // Находим предыдущее и текущее состояние этого сустава
+                        if let (Some(prev_state), Some(curr_state)) = (
+                            previous_joint_states.iter().find(|js| js.joint_id == joint.id),
+                            current_joint_states.iter().find(|js| js.joint_id == joint.id)
+                        ) {
+                            let ang_vel = (curr_state.angle - prev_state.angle) / dt;
+                            
+                            // Отладочная информация
+                            if creature.id == 0 && bone.id < 2 {
+                                eprintln!("DEBUG BIOMECH ANGVEL: Кость {}: сустав {} найден, угловая скорость = {:.4} (предыдущий угол={:.4}, текущий угол={:.4})", 
+                                    bone.id, joint.id, ang_vel, prev_state.angle, curr_state.angle);
+                            }
+                            
+                            ang_vel
+                        } else {
+                            if creature.id == 0 && bone.id < 2 {
+                                eprintln!("DEBUG BIOMECH ANGVEL: Кость {}: сустав {} найден, но состояния не найдены", bone.id, joint.id);
+                            }
+                            0.0
+                        }
+                    } else {
+                        if creature.id == 0 && bone.id < 2 {
+                            eprintln!("DEBUG BIOMECH ANGVEL: Кость {}: сустав между родителем {} и костью {} не найден", bone.id, parent_id, bone.id);
+                        }
+                        0.0
+                    }
+                } else {
+                    // У корневой кости нет родителя, но может быть сустав, где bone1_id == bone2_id == bone.id
+                    // Ищем сустав, где кость соединена сама с собой (начальный сустав)
+                    if let Some(joint) = creature.genome.joints.iter().find(|j| 
+                        j.bone1_id == bone.id && j.bone2_id == bone.id
+                    ) {
+                        if let (Some(prev_state), Some(curr_state)) = (
+                            previous_joint_states.iter().find(|js| js.joint_id == joint.id),
+                            current_joint_states.iter().find(|js| js.joint_id == joint.id)
+                        ) {
+                            (curr_state.angle - prev_state.angle) / dt
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    }
+                };
+                
+                // Если кость движется вниз (угловая скорость отрицательная для вертикальных костей)
+                // или движется горизонтально, она отталкивается от земли
+                // Сила отталкивания зависит от скорости движения кости
+                let bone_velocity_x = -angular_velocity * bone.length * bone_angle.sin();
+                let bone_velocity_y = angular_velocity * bone.length * bone_angle.cos();
+                
+                // Сила отталкивания пропорциональна скорости движения кости и силе мышц
+                let muscle_force_sum: f32 = muscle_activations.iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i < creature.genome.muscles.len())
+                    .map(|(i, activation)| {
+                        let muscle = &creature.genome.muscles[i];
+                        if muscle.bone1_id == bone.id || muscle.bone2_id == bone.id {
+                            self.calculate_muscle_force(muscle, *activation)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum();
+                
+                // Сила отталкивания направлена вверх и вперед (противоположно движению кости)
+                let push_force_scale = (bone_velocity_x * bone_velocity_x + bone_velocity_y * bone_velocity_y).sqrt() * muscle_force_sum * 0.1;
+                
+                // Направление силы: противоположно движению кости (отталкивание)
+                if push_force_scale > 0.0 {
+                    let force_dir_x = -bone_velocity_x / (bone_velocity_x * bone_velocity_x + bone_velocity_y * bone_velocity_y).sqrt().max(0.001);
+                    let force_dir_y = -bone_velocity_y / (bone_velocity_x * bone_velocity_x + bone_velocity_y * bone_velocity_y).sqrt().max(0.001);
+                    
+                    total_force.x += force_dir_x * push_force_scale;
+                    total_force.y += force_dir_y * push_force_scale;
+                    
+                    // Отладочная информация (только для первого существа)
+                    if creature.id == 0 && bone.id < 2 {
+                        eprintln!("DEBUG BIOMECH: Кость {} касается земли (Z={:.2})", bone.id, bone_end_z);
+                        eprintln!("DEBUG BIOMECH: Угловая скорость: {:.4}, Сила мышц: {:.4}", angular_velocity, muscle_force_sum);
+                        eprintln!("DEBUG BIOMECH: Скорость кости: ({:.4}, {:.4})", bone_velocity_x, bone_velocity_y);
+                        eprintln!("DEBUG BIOMECH: Сила отталкивания: ({:.4}, {:.4})", force_dir_x * push_force_scale, force_dir_y * push_force_scale);
+                    }
+                } else if creature.id == 0 && bone.id < 2 {
+                    eprintln!("DEBUG BIOMECH: Кость {} касается земли, но push_force_scale = 0 (угловая скорость: {:.4}, сила мышц: {:.4})", bone.id, angular_velocity, muscle_force_sum);
+                }
+            } else if creature.id == 0 && bone.id < 2 {
+                eprintln!("DEBUG BIOMECH: Кость {} НЕ касается земли (Z={:.2}, требуется <= {:.2})", bone.id, bone_end_z, ground_level + ground_tolerance);
             }
         }
         
@@ -158,6 +301,11 @@ impl Biomechanics {
         if force_magnitude > max_force {
             total_force.x = (total_force.x / force_magnitude) * max_force;
             total_force.y = (total_force.y / force_magnitude) * max_force;
+        }
+        
+        // Отладочная информация
+        if creature.id == 0 {
+            eprintln!("DEBUG BIOMECH: Общая сила движения: ({:.4}, {:.4}, {:.4})", total_force.x, total_force.y, total_force.z);
         }
         
         total_force

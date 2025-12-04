@@ -1042,13 +1042,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     0.0
                 };
                 
+                // Базовые входы (должны соответствовать нейросети):
+                // Вход 0: близость еды
                 inputs.push(food_proximity);
+                // Вход 1: направление к еде X
                 inputs.push(food_direction_x);
+                // Вход 2: направление к еде Y
                 inputs.push(food_direction_y);
+                // Вход 3: энергия
                 inputs.push(energy / 100.0);
+                // Вход 4: возраст
                 inputs.push(age / 100.0);
-                let vel_mag = (creature_velocity.x * creature_velocity.x + creature_velocity.y * creature_velocity.y + creature_velocity.z * creature_velocity.z).sqrt();
-                inputs.push(vel_mag / 5.0);
+                // Вход 5: скорость X
+                inputs.push(creature_velocity.x / 5.0);
+                // Вход 6: скорость Y
+                inputs.push(creature_velocity.y / 5.0);
                 
                 // Подготавливаем данные для органов чувств (только в радиусе для оптимизации)
                 let sensor_range = creature.genome.sensors.iter()
@@ -1178,7 +1186,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 
                 // Вычисляем выходы нейросети
                 let mut network = Network::new(&creature.genome.neural_network);
+                
+                // Отладочная информация (только для первого существа, чтобы не спамить)
+                if creature_id == 0 && idx == 0 {
+                    eprintln!("DEBUG: Входов для нейросети: {}, Ожидается минимум 7", inputs.len());
+                    eprintln!("DEBUG: Первые 7 входов: {:?}", &inputs[0..inputs.len().min(7)]);
+                    eprintln!("DEBUG: Количество мышц: {}", creature.genome.muscles.len());
+                    eprintln!("DEBUG: Количество выходов нейросети: {}", creature.genome.neural_network.node_genes.iter().filter(|n| matches!(n.node_type, crate::neural::NodeType::Output)).count());
+                }
+                
                 let outputs = network.forward(&inputs);
+                
+                // Отладочная информация
+                if creature_id == 0 && idx == 0 {
+                    eprintln!("DEBUG: Выходов получено: {:?}", outputs);
+                }
                 
                 // Используем выходы для активации мышц
                 let mut muscle_activations = vec![0.0; creature.genome.muscles.len()];
@@ -1186,6 +1208,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     if i < muscle_activations.len() {
                         muscle_activations[i] = output.max(0.0).min(1.0); // Ограничиваем 0-1
                     }
+                }
+                
+                // Отладочная информация
+                if creature_id == 0 && idx == 0 {
+                    eprintln!("DEBUG: Активации мышц: {:?}", muscle_activations);
                 }
                 
                 // Если выходов меньше чем мышц, заполняем остальные нулями
@@ -1218,6 +1245,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     &muscle_activations,
                 );
                 
+                // Отладочная информация: проверяем, есть ли моменты (до использования joint_torques)
+                if creature_id == 0 && idx == 0 {
+                    eprintln!("DEBUG JOINT: Количество моментов вращения: {}", joint_torques.len());
+                    for (joint_id, torque) in &joint_torques {
+                        eprintln!("DEBUG JOINT: Сустав {}: момент = {:.4}", joint_id, torque);
+                    }
+                }
+                
+                // Сохраняем предыдущие состояния суставов ДО обновления углов
+                // Это нужно для вычисления угловой скорости при расчете движения
+                let previous_joint_states = creature.joint_states.clone();
+                
                 // Применяем моменты к суставам
                 for (joint_id, torque) in joint_torques {
                     if let Some(joint_state) = updated_joint_states.iter_mut().find(|js| js.joint_id == joint_id) {
@@ -1228,11 +1267,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                             let angular_acceleration = torque / moment_of_inertia;
                             
                             // Обновляем угловую скорость и угол
-                            let angular_velocity = angular_acceleration * dt - joint_state.angle * joint.ligament.damping;
-                            joint_state.angle += angular_velocity * dt;
+                            // Угловая скорость накапливается от ускорения
+                            let current_angular_velocity = angular_acceleration * dt;
+                            // Применяем демпфирование к текущей угловой скорости
+                            let damped_angular_velocity = current_angular_velocity * (1.0 - joint.ligament.damping * dt);
+                            // Обновляем угол на основе угловой скорости
+                            joint_state.angle += damped_angular_velocity * dt;
                             
-                            // Применяем ограничения связки
+                            // Применяем ограничения связки ПЕРЕД отладкой
                             joint_state.angle = joint_state.angle.max(joint.ligament.min_angle).min(joint.ligament.max_angle);
+                            
+                            // Отладочная информация
+                            if creature_id == 0 && idx == 0 && joint_id < 3 {
+                                eprintln!("DEBUG JOINT: Сустав {}: момент={:.4}, ускорение={:.4}, угловая скорость={:.4}, угол={:.4} (ограничен до [{:.4}, {:.4}])", 
+                                    joint_id, torque, angular_acceleration, damped_angular_velocity, joint_state.angle, joint.ligament.min_angle, joint.ligament.max_angle);
+                            }
                         }
                     }
                 }
@@ -1254,9 +1303,25 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 }
                 
                 // Рассчитываем движение на основе активации мышц и углов суставов
-                let muscle_force = biomechanics_snapshot.calculate_movement_from_muscles(
+                // Движение происходит за счет отталкивания костей от земли
+                // Используем обновленные состояния суставов для расчета движения
+                // ВАЖНО: передаем updated_joint_states в функцию, которая будет использовать их как текущие
+                // Для этого нужно изменить сигнатуру функции или создать временную структуру
+                // Пока используем обходной путь: передаем updated_joint_states как текущие состояния
+                // через измененную логику в calculate_movement_from_muscles
+                
+                // Создаем временную копию существа с обновленными состояниями суставов
+                // Но Creature не имеет Clone, поэтому используем другой подход:
+                // передаем updated_joint_states отдельно и модифицируем функцию
+                
+                // Временно: используем updated_joint_states напрямую в calculate_movement_from_muscles
+                // Для этого нужно изменить функцию, чтобы она принимала joint_states отдельно
+                let muscle_force = biomechanics_snapshot.calculate_movement_from_muscles_with_states(
                     creature,
+                    &creature_pos,
                     &muscle_activations,
+                    &previous_joint_states,
+                    &updated_joint_states,
                     dt,
                 );
                 
@@ -2099,24 +2164,73 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         
         // Отрисовка костей (без использования радиуса)
         // Рисуем кости белым цветом для лучшей видимости
+        // Каждая кость начинается и заканчивается в суставах
         let bone_color = [1.0, 1.0, 1.0]; // Белый цвет для костей
+        let scale = 5.0; // Увеличили масштаб с 3.0 до 5.0 для более длинных костей
+        
         let bone_count = creature.genome.bones.len();
         if bone_count > 0 {
             for bone in &creature.genome.bones {
-                // Вычисляем позицию начала и конца кости в мировых 3D координатах
-                // Размеры костей в пикселях, преобразуем в мировые единицы
-                // Увеличиваем масштаб в 3 раза для лучшей видимости
-                let scale = 3.0;
-                let bone_start_x = world_x + bone.position.x / 100.0 * scale;
-                let bone_start_y = world_y + bone.position.y / 100.0 * scale;
-                let bone_start_z = world_z + bone.position.z / 100.0 * scale;
-                let bone_length = bone.length / 100.0 * scale;
-                let bone_end_x = bone_start_x + bone.angle.cos() * bone_length;
-                let bone_end_y = bone_start_y + bone.angle.sin() * bone_length;
-                let bone_end_z = bone_start_z;
+                // Находим суставы для начала и конца кости
+                // Начало кости: сустав, где bone1_id == bone.id
+                // (это может быть корневой сустав bone1_id == bone2_id == bone.id или сустав, где кость первая)
+                let start_joint = creature.genome.joints.iter().find(|j| 
+                    j.bone1_id == bone.id
+                );
+                
+                // Конец кости: сустав, где bone2_id == bone.id
+                // (это может быть концевой сустав bone1_id == bone2_id == bone.id или сустав, где кость вторая)
+                // Но не тот же сустав, что начало
+                let start_joint_id = start_joint.map(|j| j.id).unwrap_or(999999);
+                let end_joint = creature.genome.joints.iter().find(|j| 
+                    j.bone2_id == bone.id && j.id != start_joint_id
+                );
+                
+                // Определяем начало и конец кости
+                let (bone_start_x, bone_start_y, bone_start_z, bone_end_x, bone_end_y, bone_end_z) = 
+                if let (Some(start_j), Some(end_j)) = (start_joint, end_joint) {
+                    // У кости есть начало и конец в суставах
+                    (
+                        world_x + start_j.position.x / 100.0 * scale,
+                        world_y + start_j.position.y / 100.0 * scale,
+                        world_z + start_j.position.z / 100.0 * scale,
+                        world_x + end_j.position.x / 100.0 * scale,
+                        world_y + end_j.position.y / 100.0 * scale,
+                        world_z + end_j.position.z / 100.0 * scale,
+                    )
+                } else if let Some(start_j) = start_joint {
+                    // Есть только начало в суставе
+                    let bone_length = bone.length / 100.0 * scale * 10.0; // Увеличили множитель с 5.0 до 10.0
+                    let start_x = world_x + start_j.position.x / 100.0 * scale;
+                    let start_y = world_y + start_j.position.y / 100.0 * scale;
+                    let start_z = world_z + start_j.position.z / 100.0 * scale;
+                    (
+                        start_x,
+                        start_y,
+                        start_z,
+                        start_x + bone.angle.cos() * bone_length,
+                        start_y + bone.angle.sin() * bone_length,
+                        start_z,
+                    )
+                } else {
+                    // Если суставов нет, используем позицию кости и длину
+                    let bone_length = bone.length / 100.0 * scale * 10.0; // Увеличили множитель с 5.0 до 10.0
+                    let start_x = world_x + bone.position.x / 100.0 * scale;
+                    let start_y = world_y + bone.position.y / 100.0 * scale;
+                    let start_z = world_z + bone.position.z / 100.0 * scale;
+                    (
+                        start_x,
+                        start_y,
+                        start_z,
+                        start_x + bone.angle.cos() * bone_length,
+                        start_y + bone.angle.sin() * bone_length,
+                        start_z,
+                    )
+                };
                 
                 // Рисуем кость как цилиндр в 3D
-                let bone_radius = bone.width / 100.0_f32.max(1.0) * scale; // Радиус цилиндра (увеличили для видимости)
+                // Радиус кости такой же, как у сустава
+                let bone_radius = 0.015; // Такой же радиус, как у суставов
                 let segments = 6; // Количество сегментов для цилиндра
                 
                 // Направление кости
@@ -2203,7 +2317,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let joint_x = world_x + joint.position.x / 100.0 * scale;
             let joint_y = world_y + joint.position.y / 100.0 * scale;
             let joint_z = world_z + joint.position.z / 100.0 * scale;
-            let joint_radius = 0.06; // Размер сустава в мировых координатах (увеличили в 3 раза)
+            let joint_radius = 0.015; // Размер сустава в мировых координатах (уменьшили, чтобы не перекрывать кости)
             let segments = 6; // Количество сегментов для сферы
             
             // Создаем сферу из треугольников
@@ -2244,34 +2358,27 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             }
         }
         
-        // Отрисовка мышц (линии между точками прикрепления)
+        // Отрисовка мышц (линии между концевыми суставами костей)
         for (muscle_idx, muscle) in creature.genome.muscles.iter().enumerate() {
-            if let (Some(bone1), Some(bone2)) = (
-                creature.genome.bones.get(muscle.bone1_id),
-                creature.genome.bones.get(muscle.bone2_id),
+            // Находим концевые суставы, к которым прикреплена мышца
+            if let (Some(end_joint1), Some(end_joint2)) = (
+                creature.genome.joints.iter().find(|j| j.id == muscle.end_joint1_id),
+                creature.genome.joints.iter().find(|j| j.id == muscle.end_joint2_id),
             ) {
-                // Вычисляем позиции точек прикрепления на костях в мировых 3D координатах
-                let scale = 3.0; // Масштаб для увеличения размера
-                let bone1_start_x = world_x + bone1.position.x / 100.0 * scale;
-                let bone1_start_y = world_y + bone1.position.y / 100.0 * scale;
-                let bone1_start_z = world_z + bone1.position.z / 100.0 * scale;
-                let bone1_length = bone1.length / 100.0 * scale;
-                let attach1_x = bone1_start_x + bone1.angle.cos() * bone1_length * muscle.attachment_point1;
-                let attach1_y = bone1_start_y + bone1.angle.sin() * bone1_length * muscle.attachment_point1;
-                let attach1_z = bone1_start_z;
+                // Вычисляем позиции концевых суставов в мировых 3D координатах
+                let scale = 5.0; // Масштаб для увеличения размера
+                let attach1_x = world_x + end_joint1.position.x / 100.0 * scale;
+                let attach1_y = world_y + end_joint1.position.y / 100.0 * scale;
+                let attach1_z = world_z + end_joint1.position.z / 100.0 * scale;
                 
-                let bone2_start_x = world_x + bone2.position.x / 100.0 * scale;
-                let bone2_start_y = world_y + bone2.position.y / 100.0 * scale;
-                let bone2_start_z = world_z + bone2.position.z / 100.0 * scale;
-                let bone2_length = bone2.length / 100.0 * scale;
-                let attach2_x = bone2_start_x + bone2.angle.cos() * bone2_length * muscle.attachment_point2;
-                let attach2_y = bone2_start_y + bone2.angle.sin() * bone2_length * muscle.attachment_point2;
-                let attach2_z = bone2_start_z;
+                let attach2_x = world_x + end_joint2.position.x / 100.0 * scale;
+                let attach2_y = world_y + end_joint2.position.y / 100.0 * scale;
+                let attach2_z = world_z + end_joint2.position.z / 100.0 * scale;
                 
                 // Рисуем мышцу как цилиндр в 3D
                 // Мышцы рисуем розовым/красным цветом для отличия
                 let muscle_base_color = [1.0, 0.5, 0.5]; // Розовый цвет для мышц
-                let muscle_radius = 0.045; // Радиус мышцы в мировых координатах (увеличили в 3 раза)
+                let muscle_radius = 0.01; // Радиус мышцы в мировых координатах (уменьшили для пропорций)
                 let segments = 6; // Количество сегментов для цилиндра
                 
                 // Цвет мышцы зависит от активации (используем правильный индекс)
