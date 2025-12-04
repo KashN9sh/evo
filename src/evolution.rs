@@ -160,19 +160,63 @@ impl EvolutionSystem {
             self.mutate_sensors(genome, rng);
         }
         
-        // Мутации частей тела (увеличена частота)
-        if rng.gen::<f32>() < self.mutation_rate * 0.8 {
+        // Мутации частей тела (увеличена частота для роста новых частей)
+        // Вероятность зависит от количества существующих частей - чем меньше частей, тем больше вероятность роста
+        let body_mutation_chance = if genome.bones.len() < 3 {
+            self.mutation_rate * 1.5 // Очень высокая вероятность если мало частей
+        } else if genome.bones.len() < 5 {
+            self.mutation_rate * 1.2 // Высокая вероятность
+        } else {
+            self.mutation_rate * 0.8 // Обычная вероятность
+        };
+        
+        if rng.gen::<f32>() < body_mutation_chance {
             self.mutate_body_parts(genome, rng);
         }
         
-        // Мутации мышц (увеличена частота)
-        if rng.gen::<f32>() < self.mutation_rate * 0.7 {
+        // Мутации мышц (увеличена частота, особенно если мышц мало)
+        let muscle_mutation_chance = if genome.muscles.len() < 2 {
+            self.mutation_rate * 1.5 // Очень высокая вероятность если мало мышц
+        } else if genome.muscles.len() < 4 {
+            self.mutation_rate * 1.2
+        } else {
+            self.mutation_rate * 0.7
+        };
+        
+        if rng.gen::<f32>() < muscle_mutation_chance {
             self.mutate_muscles(genome, rng);
         }
         
         // Мутации метаболизма
         if rng.gen::<f32>() < self.mutation_rate * 0.4 {
             self.mutate_metabolism(genome, rng);
+        }
+    }
+    
+    /// Мутация с учетом влияния нейросети на рост новых частей
+    /// neural_outputs - выходы нейросети, которые могут влиять на то, что отрастет
+    pub fn mutate_with_neural_influence(&self, genome: &mut Genome, neural_outputs: &[f32], rng: &mut impl Rng) {
+        // Обычные мутации
+        self.mutate(genome, rng);
+        
+        // Дополнительные мутации на основе выходов нейросети
+        // Если нейросеть "хочет" больше частей тела, увеличиваем вероятность роста
+        if neural_outputs.len() > 0 {
+            // Используем среднее значение выходов как индикатор "желания" роста
+            let avg_output = neural_outputs.iter().sum::<f32>() / neural_outputs.len() as f32;
+            
+            // Если выходы высокие, увеличиваем вероятность роста новых частей
+            if avg_output > 0.7 && rng.gen::<f32>() < avg_output * 0.5 {
+                // Высокая активация = желание роста
+                if genome.bones.len() < 15 {
+                    self.mutate_body_parts(genome, rng);
+                }
+            }
+            
+            // Если выходы низкие, но есть только одна мышца - все равно пытаемся добавить
+            if avg_output < 0.3 && genome.muscles.len() < 2 && rng.gen::<f32>() < 0.8 {
+                self.mutate_muscles(genome, rng);
+            }
         }
     }
 
@@ -338,8 +382,16 @@ impl EvolutionSystem {
             }
         }
         
-        // Добавление новой кости (увеличена вероятность)
-        if rng.gen::<f32>() < 0.6 && genome.bones.len() < 15 {
+        // Добавление новой кости (увеличена вероятность, особенно если костей мало)
+        let bone_add_chance = if genome.bones.len() < 2 {
+            0.9 // Очень высокая вероятность если костей мало
+        } else if genome.bones.len() < 5 {
+            0.7 // Высокая вероятность
+        } else {
+            0.4 // Обычная вероятность
+        };
+        
+        if rng.gen::<f32>() < bone_add_chance && genome.bones.len() < 15 {
             let parent_id = if genome.bones.len() > 0 {
                 Some(rng.gen_range(0..genome.bones.len()))
             } else {
@@ -424,9 +476,18 @@ impl EvolutionSystem {
     }
     
     fn mutate_muscles(&self, genome: &mut Genome, rng: &mut impl Rng) {
-        // Добавить/удалить мышцу (увеличена вероятность добавления)
-        if rng.gen::<f32>() < 0.7 {
-            if rng.gen::<f32>() < 0.8 && genome.muscles.len() < 20 {
+        // Если мышц очень мало, приоритет на добавление новых мышц
+        let muscle_add_chance = if genome.muscles.len() < 2 {
+            0.95 // Почти гарантированно добавляем мышцу если их мало
+        } else if genome.muscles.len() < 4 {
+            0.8 // Высокая вероятность
+        } else {
+            0.7 // Обычная вероятность
+        };
+        
+        // Добавить/удалить мышцу (увеличена вероятность добавления, особенно если мышц мало)
+        if rng.gen::<f32>() < muscle_add_chance {
+            if rng.gen::<f32>() < 0.9 && genome.muscles.len() < 20 {
                 // Пытаемся добавить мышцу через существующий сустав
                 if genome.joints.len() > 0 {
                     let joint_idx = rng.gen_range(0..genome.joints.len());

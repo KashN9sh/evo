@@ -56,17 +56,17 @@ impl Biomechanics {
         creature.genome.bones.iter().map(|b| b.mass).sum()
     }
     
-    /// Рассчитывает движение на основе активации мышц и углов суставов
-    /// Возвращает вектор силы, который будет применен к существу
-    pub fn calculate_movement_from_muscles(
+    /// Рассчитывает момент вращения от мышц вокруг суставов
+    /// Мышцы тянут кости, создавая вращающий момент вокруг сустава
+    pub fn calculate_joint_torques_from_muscles(
         &self,
         creature: &Creature,
         muscle_activations: &[f32],
-        dt: f32,
-    ) -> cgmath::Vector3<f32> {
-        let mut total_force = cgmath::Vector3::new(0.0, 0.0, 0.0);
+    ) -> Vec<(usize, f32)> {
+        // Возвращаем список (joint_id, torque) для каждого сустава
+        let mut joint_torques: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
         
-        // Рассчитываем силу от каждой мышцы
+        // Рассчитываем момент вращения от каждой мышцы
         for (i, activation) in muscle_activations.iter().enumerate() {
             if i < creature.genome.muscles.len() {
                 let muscle = &creature.genome.muscles[i];
@@ -79,24 +79,78 @@ impl Biomechanics {
                 ) {
                     // Находим состояние сустава
                     if let Some(joint_state) = creature.joint_states.iter().find(|js| js.joint_id == muscle.joint_id) {
-                        // Вычисляем направление силы на основе угла между костями
-                        let bone1_angle = bone1.angle;
-                        let bone2_angle = bone2.angle + joint_state.angle;
+                        // Вычисляем плечо рычага - расстояние от точки прикрепления мышцы до сустава
+                        // attachment_point - это доля длины кости от начала (0.0 = начало, 1.0 = конец)
+                        let lever_arm1 = bone1.length * muscle.attachment_point1;
+                        let lever_arm2 = bone2.length * muscle.attachment_point2;
                         
-                        // Средний угол для направления силы
-                        let force_angle = (bone1_angle + bone2_angle) / 2.0;
+                        // Момент вращения = сила * плечо рычага
+                        // Мышца тянет кости друг к другу, создавая момент вращения вокруг сустава
+                        // Направление момента зависит от того, какая кость вращается
+                        let torque = force_magnitude * (lever_arm1 + lever_arm2) * 0.5;
                         
-                        total_force.x += force_angle.cos() * force_magnitude;
-                        total_force.y += force_angle.sin() * force_magnitude;
-                        total_force.z = 0.0; // Движение в плоскости XY
+                        // Момент направлен на сгибание сустава (уменьшение угла)
+                        // Если активация > 0.5, мышца сгибает сустав, иначе разгибает
+                        let direction = if *activation > 0.5 { -1.0 } else { 1.0 };
+                        let final_torque = torque * direction;
+                        
+                        *joint_torques.entry(muscle.joint_id).or_insert(0.0) += final_torque;
                     }
                 }
             }
         }
         
-        // Применяем механическое преимущество рычагов
-        let mechanical_advantage = self.calculate_lever_mechanical_advantage(creature);
-        total_force *= mechanical_advantage;
+        joint_torques.into_iter().collect()
+    }
+    
+    /// Рассчитывает движение на основе активации мышц и углов суставов
+    /// Возвращает вектор силы, который будет применен к существу
+    /// Движение возникает из-за того, что кости толкают/тянут тело при вращении вокруг суставов
+    pub fn calculate_movement_from_muscles(
+        &self,
+        creature: &Creature,
+        muscle_activations: &[f32],
+        dt: f32,
+    ) -> cgmath::Vector3<f32> {
+        let mut total_force = cgmath::Vector3::new(0.0, 0.0, 0.0);
+        
+        // Рассчитываем силу от каждой мышцы через вращение костей вокруг суставов
+        for (i, activation) in muscle_activations.iter().enumerate() {
+            if i < creature.genome.muscles.len() {
+                let muscle = &creature.genome.muscles[i];
+                let force_magnitude = self.calculate_muscle_force(muscle, *activation);
+                
+                // Находим кости, к которым прикреплена мышца
+                if let (Some(bone1), Some(bone2)) = (
+                    creature.genome.bones.get(muscle.bone1_id),
+                    creature.genome.bones.get(muscle.bone2_id),
+                ) {
+                    // Находим состояние сустава
+                    if let Some(joint_state) = creature.joint_states.iter().find(|js| js.joint_id == muscle.joint_id) {
+                        // Вычисляем позицию конца кости (которая толкает тело)
+                        // Кость вращается вокруг сустава, и ее конец создает силу
+                        let bone1_angle = bone1.angle;
+                        let bone2_angle = bone2.angle + joint_state.angle;
+                        
+                        // Конец второй кости (дальше от сустава) толкает тело
+                        let bone_end_x = joint_state.angle.cos() * bone2.length;
+                        let bone_end_y = joint_state.angle.sin() * bone2.length;
+                        
+                        // Сила направлена от конца кости (кость толкает тело при движении)
+                        // Угловая скорость сустава влияет на силу
+                        let angular_velocity = joint_state.angle; // Упрощенно используем угол как скорость
+                        let force_scale = angular_velocity.abs() * force_magnitude;
+                        
+                        // Направление силы зависит от направления вращения
+                        let force_angle = bone2_angle + if angular_velocity > 0.0 { std::f32::consts::PI / 2.0 } else { -std::f32::consts::PI / 2.0 };
+                        
+                        total_force.x += force_angle.cos() * force_scale;
+                        total_force.y += force_angle.sin() * force_scale;
+                        total_force.z = 0.0; // Движение в плоскости XY
+                    }
+                }
+            }
+        }
         
         // Ограничиваем максимальную силу
         let max_force = 10.0;

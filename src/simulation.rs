@@ -208,6 +208,8 @@ pub struct SimulationState {
     time_scale: f32,
     slider_dragging: bool,
     camera_dragging: bool,
+    camera_panning: bool, // Перемещение камеры
+    shift_pressed: bool, // Состояние клавиши Shift
     last_mouse_pos: (f32, f32),
     mouse_pos: (f32, f32),
     stats: EvolutionStats,
@@ -569,6 +571,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             time_scale: 50.0, // Увеличиваем скорость по умолчанию в 50 раз
             slider_dragging: false,
             camera_dragging: false,
+            camera_panning: false,
+            shift_pressed: false,
             last_mouse_pos: (0.0, 0.0),
             mouse_pos: (0.0, 0.0),
             stats: EvolutionStats::new(),
@@ -671,6 +675,48 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
                 }
                 
+                if self.camera_panning {
+                    // Перемещение камеры (панорамирование) - как в 3D редакторах
+                    // Перемещаем камеру в плоскости экрана (вправо-влево, вверх-вниз относительно экрана)
+                    let dx = new_pos.0 - self.last_mouse_pos.0;
+                    let dy = new_pos.1 - self.last_mouse_pos.1;
+                    
+                    // Чувствительность перемещения камеры
+                    let pan_sensitivity = self.camera.distance * 0.001; // Пропорционально расстоянию камеры
+                    
+                    // Вычисляем векторы направления камеры
+                    let forward = cgmath::Vector3::new(
+                        self.camera.target.x - self.camera.eye.x,
+                        self.camera.target.y - self.camera.eye.y,
+                        self.camera.target.z - self.camera.eye.z,
+                    ).normalize();
+                    
+                    // Вектор "вправо" - перпендикулярно forward и up
+                    let right = forward.cross(self.camera.up).normalize();
+                    
+                    // Вектор "вверх" относительно камеры (не путать с мировым up)
+                    let up = right.cross(forward).normalize();
+                    
+                    // Перемещаем и камеру, и цель в плоскости экрана
+                    // Инвертируем направление - движение мыши вправо перемещает камеру влево
+                    let pan_x = right * (-dx * pan_sensitivity);
+                    let pan_y = up * (dy * pan_sensitivity); // Инвертируем направление
+                    
+                    self.camera.target.x += pan_x.x;
+                    self.camera.target.y += pan_x.y;
+                    self.camera.target.z += pan_x.z;
+                    
+                    self.camera.target.x += pan_y.x;
+                    self.camera.target.y += pan_y.y;
+                    self.camera.target.z += pan_y.z;
+                    
+                    self.camera.update_eye_from_angles();
+                    
+                    // Обновляем uniform буфер камеры
+                    self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().into();
+                    self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+                }
+                
                 if self.slider_dragging {
                     self.update_slider_from_mouse();
                 }
@@ -679,12 +725,26 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 self.mouse_pos = new_pos;
                 false
             }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Отслеживаем состояние клавиши Shift
+                // В новой версии winit используется Key вместо KeyCode
+                use winit::keyboard::{Key, NamedKey};
+                if let Key::Named(NamedKey::Shift) = event.logical_key {
+                    self.shift_pressed = event.state == winit::event::ElementState::Pressed;
+                }
+                false
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 match button {
                     winit::event::MouseButton::Left => {
                         match state {
                             winit::event::ElementState::Pressed => {
-                                if self.is_mouse_on_slider() {
+                                // Если зажат Shift - перемещение камеры
+                                if self.shift_pressed {
+                                    self.camera_panning = true;
+                                    self.last_mouse_pos = self.mouse_pos;
+                                    return true;
+                                } else if self.is_mouse_on_slider() {
                                     self.slider_dragging = true;
                                     self.update_slider_from_mouse();
                                     return true;
@@ -696,6 +756,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                             }
                             winit::event::ElementState::Released => {
                                 self.slider_dragging = false;
+                                self.camera_panning = false;
                             }
                         }
                     }
@@ -1148,18 +1209,45 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     }
                 }
                 
-                // Обновляем углы суставов на основе целевых углов
+                // Обновляем углы суставов на основе моментов вращения от мышц
                 let mut updated_joint_states = creature.joint_states.clone();
+                
+                // Вычисляем моменты вращения от мышц вокруг каждого сустава
+                let joint_torques = biomechanics_snapshot.calculate_joint_torques_from_muscles(
+                    creature,
+                    &muscle_activations,
+                );
+                
+                // Применяем моменты к суставам
+                for (joint_id, torque) in joint_torques {
+                    if let Some(joint_state) = updated_joint_states.iter_mut().find(|js| js.joint_id == joint_id) {
+                        if let Some(joint) = creature.genome.joints.iter().find(|j| j.id == joint_id) {
+                            // Момент вращения создает угловое ускорение
+                            // Упрощенно: момент = момент инерции * угловое ускорение
+                            let moment_of_inertia = 1.0; // Упрощенная модель
+                            let angular_acceleration = torque / moment_of_inertia;
+                            
+                            // Обновляем угловую скорость и угол
+                            let angular_velocity = angular_acceleration * dt - joint_state.angle * joint.ligament.damping;
+                            joint_state.angle += angular_velocity * dt;
+                            
+                            // Применяем ограничения связки
+                            joint_state.angle = joint_state.angle.max(joint.ligament.min_angle).min(joint.ligament.max_angle);
+                        }
+                    }
+                }
+                
+                // Также обновляем углы на основе целевых углов от нейросети (для плавности)
                 for (i, target_angle) in joint_target_angles.iter().enumerate() {
                     if i < updated_joint_states.len() {
                         let joint_state = &mut updated_joint_states[i];
                         if let Some(joint) = creature.genome.joints.iter().find(|j| j.id == joint_state.joint_id) {
-                            // Применяем ограничения связки
+                            // Плавное движение к целевому углу (дополнительно к моменту от мышц)
                             let clamped_target = target_angle.max(joint.ligament.min_angle).min(joint.ligament.max_angle);
                             let angle_error = clamped_target - joint_state.angle;
-                            let torque = angle_error * joint.ligament.stiffness;
-                            let angular_velocity = torque - joint_state.angle * joint.ligament.damping;
-                            joint_state.angle += angular_velocity * dt;
+                            let spring_torque = angle_error * joint.ligament.stiffness * 0.1; // Слабая пружина для плавности
+                            let spring_angular_velocity = spring_torque * dt;
+                            joint_state.angle += spring_angular_velocity;
                             joint_state.angle = joint_state.angle.max(joint.ligament.min_angle).min(joint.ligament.max_angle);
                         }
                     }
@@ -1348,7 +1436,17 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let mut new_genome = if let Some(genome) = last_genome {
                 // Мутируем геном умершего существа
                 let mut mutated_genome = genome;
-                evolution_system.mutate(&mut mutated_genome, &mut rng);
+                
+                // Если у существа было мало частей тела, увеличиваем вероятность роста
+                if mutated_genome.bones.len() < 3 || mutated_genome.muscles.len() < 2 {
+                    // Агрессивные мутации для роста новых частей
+                    for _ in 0..3 {
+                        evolution_system.mutate(&mut mutated_genome, &mut rng);
+                    }
+                } else {
+                    evolution_system.mutate(&mut mutated_genome, &mut rng);
+                }
+                
                 mutated_genome
             } else {
                 // Создаем новый базовый геном
@@ -1356,7 +1454,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             };
             
             // Дополнительные мутации для перерождения (более агрессивные)
-            evolution_system.mutate(&mut new_genome, &mut rng);
+            // Особенно если частей тела мало - существо должно отрастить новые части
+            if new_genome.bones.len() < 3 || new_genome.muscles.len() < 2 {
+                // Множественные мутации для гарантированного роста
+                for _ in 0..5 {
+                    evolution_system.mutate(&mut new_genome, &mut rng);
+                }
+            } else {
+                evolution_system.mutate(&mut new_genome, &mut rng);
+            }
             
             // Создаем новое существо в случайной позиции
             let x = rng.gen_range(100.0..1180.0);
@@ -1992,22 +2098,26 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let bone_scale = 0.003; // Масштаб для преобразования размеров костей
         
         // Отрисовка костей (без использования радиуса)
+        // Рисуем кости белым цветом для лучшей видимости
+        let bone_color = [1.0, 1.0, 1.0]; // Белый цвет для костей
         let bone_count = creature.genome.bones.len();
         if bone_count > 0 {
             for bone in &creature.genome.bones {
                 // Вычисляем позицию начала и конца кости в мировых 3D координатах
                 // Размеры костей в пикселях, преобразуем в мировые единицы
-                let bone_start_x = world_x + bone.position.x / 100.0;
-                let bone_start_y = world_y + bone.position.y / 100.0;
-                let bone_start_z = world_z + bone.position.z / 100.0;
-                let bone_length = bone.length / 100.0;
+                // Увеличиваем масштаб в 3 раза для лучшей видимости
+                let scale = 3.0;
+                let bone_start_x = world_x + bone.position.x / 100.0 * scale;
+                let bone_start_y = world_y + bone.position.y / 100.0 * scale;
+                let bone_start_z = world_z + bone.position.z / 100.0 * scale;
+                let bone_length = bone.length / 100.0 * scale;
                 let bone_end_x = bone_start_x + bone.angle.cos() * bone_length;
                 let bone_end_y = bone_start_y + bone.angle.sin() * bone_length;
                 let bone_end_z = bone_start_z;
                 
                 // Рисуем кость как цилиндр в 3D
-                let bone_radius = bone.width / 200.0; // Радиус цилиндра
-                let segments = 8; // Количество сегментов для цилиндра
+                let bone_radius = bone.width / 100.0_f32.max(1.0) * scale; // Радиус цилиндра (увеличили для видимости)
+                let segments = 6; // Количество сегментов для цилиндра
                 
                 // Направление кости
                 let dir_x = bone_end_x - bone_start_x;
@@ -2073,25 +2183,28 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                         let end_circle2_z = bone_end_z + (perp1.2 * angle2.cos() + perp2.2 * angle2.sin()) * bone_radius;
                         
                         // Два треугольника для сегмента цилиндра
-                        vertices.push(Vertex { position: [start_circle1_x, start_circle1_y, start_circle1_z], color });
-                        vertices.push(Vertex { position: [start_circle2_x, start_circle2_y, start_circle2_z], color });
-                        vertices.push(Vertex { position: [end_circle1_x, end_circle1_y, end_circle1_z], color });
+                        vertices.push(Vertex { position: [start_circle1_x, start_circle1_y, start_circle1_z], color: bone_color });
+                        vertices.push(Vertex { position: [start_circle2_x, start_circle2_y, start_circle2_z], color: bone_color });
+                        vertices.push(Vertex { position: [end_circle1_x, end_circle1_y, end_circle1_z], color: bone_color });
                         
-                        vertices.push(Vertex { position: [start_circle2_x, start_circle2_y, start_circle2_z], color });
-                        vertices.push(Vertex { position: [end_circle2_x, end_circle2_y, end_circle2_z], color });
-                        vertices.push(Vertex { position: [end_circle1_x, end_circle1_y, end_circle1_z], color });
+                        vertices.push(Vertex { position: [start_circle2_x, start_circle2_y, start_circle2_z], color: bone_color });
+                        vertices.push(Vertex { position: [end_circle2_x, end_circle2_y, end_circle2_z], color: bone_color });
+                        vertices.push(Vertex { position: [end_circle1_x, end_circle1_y, end_circle1_z], color: bone_color });
                     }
                 }
             }
         }
         
         // Отрисовка суставов (сферы в местах соединения костей)
+        // Рисуем суставы красным цветом для отличия от костей
+        let joint_color = [1.0, 0.0, 0.0]; // Красный цвет для суставов
+        let scale = 3.0; // Масштаб для увеличения размера
         for joint in &creature.genome.joints {
-            let joint_x = world_x + joint.position.x / 100.0;
-            let joint_y = world_y + joint.position.y / 100.0;
-            let joint_z = world_z + joint.position.z / 100.0;
-            let joint_radius = 0.08; // Размер сустава в мировых координатах
-            let segments = 8; // Количество сегментов для сферы
+            let joint_x = world_x + joint.position.x / 100.0 * scale;
+            let joint_y = world_y + joint.position.y / 100.0 * scale;
+            let joint_z = world_z + joint.position.z / 100.0 * scale;
+            let joint_radius = 0.06; // Размер сустава в мировых координатах (увеличили в 3 раза)
+            let segments = 6; // Количество сегментов для сферы
             
             // Создаем сферу из треугольников
             for i in 0..segments {
@@ -2120,13 +2233,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     let z4 = joint_z + joint_radius * phi2.sin() * theta2.sin();
                     
                     // Два треугольника для сегмента сферы
-                    vertices.push(Vertex { position: [x1, y1, z1], color });
-                    vertices.push(Vertex { position: [x2, y2, z2], color });
-                    vertices.push(Vertex { position: [x3, y3, z3], color });
+                    vertices.push(Vertex { position: [x1, y1, z1], color: joint_color });
+                    vertices.push(Vertex { position: [x2, y2, z2], color: joint_color });
+                    vertices.push(Vertex { position: [x3, y3, z3], color: joint_color });
                     
-                    vertices.push(Vertex { position: [x2, y2, z2], color });
-                    vertices.push(Vertex { position: [x4, y4, z4], color });
-                    vertices.push(Vertex { position: [x3, y3, z3], color });
+                    vertices.push(Vertex { position: [x2, y2, z2], color: joint_color });
+                    vertices.push(Vertex { position: [x4, y4, z4], color: joint_color });
+                    vertices.push(Vertex { position: [x3, y3, z3], color: joint_color });
                 }
             }
         }
@@ -2138,21 +2251,28 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 creature.genome.bones.get(muscle.bone2_id),
             ) {
                 // Вычисляем позиции точек прикрепления на костях в мировых 3D координатах
-                let bone1_start_x = world_x + bone1.position.x / 100.0;
-                let bone1_start_y = world_y + bone1.position.y / 100.0;
-                let bone1_start_z = world_z + bone1.position.z / 100.0;
-                let bone1_length = bone1.length / 100.0;
+                let scale = 3.0; // Масштаб для увеличения размера
+                let bone1_start_x = world_x + bone1.position.x / 100.0 * scale;
+                let bone1_start_y = world_y + bone1.position.y / 100.0 * scale;
+                let bone1_start_z = world_z + bone1.position.z / 100.0 * scale;
+                let bone1_length = bone1.length / 100.0 * scale;
                 let attach1_x = bone1_start_x + bone1.angle.cos() * bone1_length * muscle.attachment_point1;
                 let attach1_y = bone1_start_y + bone1.angle.sin() * bone1_length * muscle.attachment_point1;
                 let attach1_z = bone1_start_z;
                 
-                let bone2_start_x = world_x + bone2.position.x / 100.0;
-                let bone2_start_y = world_y + bone2.position.y / 100.0;
-                let bone2_start_z = world_z + bone2.position.z / 100.0;
-                let bone2_length = bone2.length / 100.0;
+                let bone2_start_x = world_x + bone2.position.x / 100.0 * scale;
+                let bone2_start_y = world_y + bone2.position.y / 100.0 * scale;
+                let bone2_start_z = world_z + bone2.position.z / 100.0 * scale;
+                let bone2_length = bone2.length / 100.0 * scale;
                 let attach2_x = bone2_start_x + bone2.angle.cos() * bone2_length * muscle.attachment_point2;
                 let attach2_y = bone2_start_y + bone2.angle.sin() * bone2_length * muscle.attachment_point2;
                 let attach2_z = bone2_start_z;
+                
+                // Рисуем мышцу как цилиндр в 3D
+                // Мышцы рисуем розовым/красным цветом для отличия
+                let muscle_base_color = [1.0, 0.5, 0.5]; // Розовый цвет для мышц
+                let muscle_radius = 0.045; // Радиус мышцы в мировых координатах (увеличили в 3 раза)
+                let segments = 6; // Количество сегментов для цилиндра
                 
                 // Цвет мышцы зависит от активации (используем правильный индекс)
                 let activation = if muscle_idx < creature.muscle_activations.len() {
@@ -2160,15 +2280,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 } else {
                     0.0
                 };
+                // Мышцы становятся ярче при активации
                 let muscle_color = [
-                    color[0] * 0.3 + activation * 0.7, // Более яркий цвет при активации
-                    color[1] * 0.3 + activation * 0.7,
-                    color[2] * 0.3 + activation * 0.7,
+                    muscle_base_color[0] * 0.5 + activation * 0.5,
+                    muscle_base_color[1] * 0.5 + activation * 0.5,
+                    muscle_base_color[2] * 0.5 + activation * 0.5,
                 ];
-                
-                // Рисуем мышцу как цилиндр в 3D
-                let muscle_radius = 0.03; // Радиус мышцы в мировых координатах
-                let segments = 6; // Количество сегментов для цилиндра
                 let dx = attach2_x - attach1_x;
                 let dy = attach2_y - attach1_y;
                 let dz = attach2_z - attach1_z;
