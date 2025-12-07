@@ -33,7 +33,7 @@ pub fn setup_ui(mut commands: Commands) {
         })
         .with_children(|parent| {
             parent.spawn(TextBundle::from_section(
-                "Эволюция существ",
+                "Evo",
                 TextStyle {
                     font_size: 20.0,
                     color: Color::WHITE,
@@ -46,7 +46,7 @@ pub fn setup_ui(mut commands: Commands) {
 pub fn update_ui_stats(stats: Res<SimulationStats>, mut query: Query<&mut Text>) {
     if let Ok(mut text) = query.get_single_mut() {
         text.sections[0].value = format!(
-            "Поколение: {}\nЛучший фитнес: {:.2}\nСредний фитнес: {:.2}\nРасстояние до цели: {:.2}",
+            "Gen: {}\nBest fit: {:.2}\nAw fit: {:.2}\nDistance to target: {:.2}",
             stats.generation, stats.best_fitness, stats.average_fitness, stats.distance_to_target
         );
     }
