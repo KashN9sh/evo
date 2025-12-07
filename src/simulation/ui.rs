@@ -20,39 +20,34 @@ impl Default for SimulationStats {
 }
 
 pub fn setup_ui(mut commands: Commands) {
-    commands.spawn(NodeBundle {
-        style: Style {
-            position_type: PositionType::Absolute,
-            top: Val::Px(10.0),
-            left: Val::Px(10.0),
-            ..default()
-        },
-        background_color: Color::srgba(0.0, 0.0, 0.0, 0.5).into(),
-        ..default()
-    }).with_children(|parent| {
-        parent.spawn(TextBundle::from_section(
-            "Эволюция существ",
-            TextStyle {
-                font_size: 20.0,
-                color: Color::WHITE,
+    commands
+        .spawn(NodeBundle {
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                left: Val::Px(10.0),
                 ..default()
             },
-        ));
-    });
+            background_color: Color::rgba(0.0, 0.0, 0.0, 0.5).into(),
+            ..default()
+        })
+        .with_children(|parent| {
+            parent.spawn(TextBundle::from_section(
+                "Эволюция существ",
+                TextStyle {
+                    font_size: 20.0,
+                    color: Color::WHITE,
+                    ..default()
+                },
+            ));
+        });
 }
 
-pub fn update_ui_stats(
-    stats: Res<SimulationStats>,
-    mut query: Query<&mut Text>,
-) {
+pub fn update_ui_stats(stats: Res<SimulationStats>, mut query: Query<&mut Text>) {
     if let Ok(mut text) = query.get_single_mut() {
         text.sections[0].value = format!(
             "Поколение: {}\nЛучший фитнес: {:.2}\nСредний фитнес: {:.2}\nРасстояние до цели: {:.2}",
-            stats.generation,
-            stats.best_fitness,
-            stats.average_fitness,
-            stats.distance_to_target
+            stats.generation, stats.best_fitness, stats.average_fitness, stats.distance_to_target
         );
     }
 }
-
