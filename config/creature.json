@@ -1,0 +1,123 @@
+{
+    "bones": [
+        {
+            "id": "torso",
+            "length": 1.0,
+            "mass": 10.0,
+            "radius": 0.15,
+            "position": [0.0, 0.0, 0.0],
+            "rotation": [0.0, 0.0, 0.0]
+        },
+        {
+            "id": "upper_arm_l",
+            "length": 0.6,
+            "mass": 2.0,
+            "radius": 0.08,
+            "position": [-0.3, 0.5, 0.0],
+            "rotation": [0.0, 0.0, 0.0]
+        },
+        {
+            "id": "upper_arm_r",
+            "length": 0.6,
+            "mass": 2.0,
+            "radius": 0.08,
+            "position": [0.3, 0.5, 0.0],
+            "rotation": [0.0, 0.0, 0.0]
+        },
+        {
+            "id": "thigh_l",
+            "length": 0.7,
+            "mass": 3.0,
+            "radius": 0.1,
+            "position": [-0.2, -0.5, 0.0],
+            "rotation": [0.0, 0.0, 0.0]
+        },
+        {
+            "id": "thigh_r",
+            "length": 0.7,
+            "mass": 3.0,
+            "radius": 0.1,
+            "position": [0.2, -0.5, 0.0],
+            "rotation": [0.0, 0.0, 0.0]
+        }
+    ],
+    "joints": [
+        {
+            "id": "shoulder_l",
+            "bone_a": "torso",
+            "bone_b": "upper_arm_l",
+            "anchor_a": [-0.3, 0.5, 0.0],
+            "anchor_b": [0.0, 0.3, 0.0],
+            "axis": [0.0, 0.0, 1.0],
+            "limits": null
+        },
+        {
+            "id": "shoulder_r",
+            "bone_a": "torso",
+            "bone_b": "upper_arm_r",
+            "anchor_a": [0.3, 0.5, 0.0],
+            "anchor_b": [0.0, 0.3, 0.0],
+            "axis": [0.0, 0.0, 1.0],
+            "limits": null
+        },
+        {
+            "id": "hip_l",
+            "bone_a": "torso",
+            "bone_b": "thigh_l",
+            "anchor_a": [-0.2, -0.5, 0.0],
+            "anchor_b": [0.0, 0.35, 0.0],
+            "axis": [1.0, 0.0, 0.0],
+            "limits": null
+        },
+        {
+            "id": "hip_r",
+            "bone_a": "torso",
+            "bone_b": "thigh_r",
+            "anchor_a": [0.2, -0.5, 0.0],
+            "anchor_b": [0.0, 0.35, 0.0],
+            "axis": [1.0, 0.0, 0.0],
+            "limits": null
+        }
+    ],
+    "muscles": [
+        {
+            "id": "shoulder_l_flex",
+            "bone_a": "torso",
+            "attachment_a": [-0.3, 0.3, 0.0],
+            "bone_b": "upper_arm_l",
+            "attachment_b": [0.0, 0.0, 0.0],
+            "max_force": 50.0,
+            "rest_length": 0.4
+        },
+        {
+            "id": "shoulder_r_flex",
+            "bone_a": "torso",
+            "attachment_a": [0.3, 0.3, 0.0],
+            "bone_b": "upper_arm_r",
+            "attachment_b": [0.0, 0.0, 0.0],
+            "max_force": 50.0,
+            "rest_length": 0.4
+        },
+        {
+            "id": "hip_l_flex",
+            "bone_a": "torso",
+            "attachment_a": [-0.2, -0.3, 0.0],
+            "bone_b": "thigh_l",
+            "attachment_b": [0.0, 0.0, 0.0],
+            "max_force": 80.0,
+            "rest_length": 0.5
+        },
+        {
+            "id": "hip_r_flex",
+            "bone_a": "torso",
+            "attachment_a": [0.2, -0.3, 0.0],
+            "bone_b": "thigh_r",
+            "attachment_b": [0.0, 0.0, 0.0],
+            "max_force": 80.0,
+            "rest_length": 0.5
+        }
+    ]
+}
+
+
+
